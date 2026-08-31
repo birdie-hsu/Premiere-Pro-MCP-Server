@@ -1,0 +1,14 @@
+.cache/
+.analysis/
+.codex/
+tools/ffmpeg-archive*/
+tools/ffmpeg-chunks*/
+tools/*.zip
+tools/bin/
+
+# Local editor, OS, and runtime artifacts
+.DS_Store
+Thumbs.db
+__pycache__/
+*.py[cod]
+node_modules/
