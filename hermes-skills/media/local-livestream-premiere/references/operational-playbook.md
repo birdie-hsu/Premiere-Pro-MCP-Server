@@ -76,6 +76,8 @@ Score candidates on a 0–100 scale and state that the score is a prioritization
 
 Subtract or flag candidates with long setup and no payoff, product-ad-only content when the request is for activities, ambiguous ASR, long silence, or an unclear ending. Do not invent visual facts from transcript alone.
 
+The local fallback additionally records one-second evidence for transcript signal, relative audio burst, scene boundary, and low-weight frame-difference motion. Use `audioBurst` for a sudden rise over the video's local level, `sceneBoundary` as an edge/candidate-generation cue, and `motionEnergy` only as supporting visual evidence. A scene cut or motion event alone is not sufficient reason to select a clip. Treat audio peak and audio burst as one audio family when checking multi-signal agreement.
+
 Return this minimum table:
 
 | ID | Source start–end | Duration | Score | Why it may travel | Quote / visual cue | Confidence |
@@ -133,4 +135,3 @@ Then call `validate_project_for_export` with `requireNonEmptyTimeline=true` and 
 - If the user supplies a new project path, use the CEP Save As operation if available and refuse an existing target unless the user explicitly authorizes replacement.
 - For an MP4, ask for an output path and preset (or confirm an existing local `.epr` preset), run `validate_project_for_export` with those paths, then use the CEP export/render tool. Do not use FFmpeg to bypass Premiere when the user asked for Premiere editing.
 - Report “sequence created but not saved/exported” when those operations were not requested or were rejected.
-

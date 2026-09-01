@@ -21,6 +21,16 @@ Use this skill when the user wants a local livestream searched for product infor
 - Saving the current `.prproj` overwrites the existing project file. Ask for explicit approval immediately before `save_project`; prefer Save As when the user gives a new path.
 - Do not overwrite an existing export or plan file unless the user explicitly requests it.
 
+## Default local scoring profile
+
+- Keep transcript/ASR as the primary semantic signal. Preserve cue timestamps, short quotes, speech coverage, speaking rate, excitement terms, and punctuation evidence; treat noisy ASR as an approximation.
+- Enable the first three visual/audio signals by default: scene boundaries, low-weight motion, and relative audio bursts. Scene boundaries prefer clean clip edges; motion is a weak frame-difference signal rather than proof of an action; audio bursts are measured against the video's local baseline rather than a fixed dB threshold.
+- Score these signals in one-second evidence bins and return per-candidate evidence. A signal timeline is kept as a local analysis artifact for re-ranking and debugging; candidates remain the review-facing output.
+- Use scene boundaries for trimming and candidate generation, not as a standalone claim that a moment is interesting. Avoid double-counting correlated audio peak and loudness signals.
+- Objects and actions remain opt-in, label-driven detectors. Do not enable them merely because a model is available.
+
+See [references/scoring-profile.md](references/scoring-profile.md) for the signal schema and weighting policy.
+
 ## MCP tool map
 
 Hermes registers MCP tools as `mcp_<server_name>_<tool_name>`. The expected servers are:
@@ -36,7 +46,7 @@ If a tool is not exposed, report the missing server/tool and continue only with 
 1. Confirm the absolute local video path and the requested cut style/length. If either materially changes the result and cannot be inferred, ask before analysis.
 2. Follow [references/operational-playbook.md](references/operational-playbook.md) for the low-token ASR search, candidate scoring, review gate, and Premiere assembly.
 3. For Hermes setup or missing tools, read [references/mcp-setup-windows.md](references/mcp-setup-windows.md). Merge its MCP block into the existing Hermes config; never replace the whole config.
-4. Return an analysis table containing ID, source start/end, duration, score, reason, short quote or visual cue, and evidence limitations.
+4. Return an analysis table containing ID, source start/end, duration, score, reason, short quote or visual cue, and evidence limitations. Include transcript, audio burst, scene boundary, and motion evidence when available.
 5. Stop after the candidate table until the user approves. “Analyze” alone is not permission to mutate Premiere; “use candidates V-02, V-05” or an equivalent explicit instruction is.
 6. After approval, verify CEP, assemble the approved ranges in a new/duplicated sequence, add navigation markers, set the new sequence active, and verify tracks, gaps, offline media, and duration.
 7. Report what was changed, what remains unsaved/unexported, and the exact next approval needed.

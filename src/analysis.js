@@ -3,7 +3,8 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { findSidecar } from './captions.js';
 import { detectScenes, probeMedia, readAudioMetrics } from './ffmpeg.js';
-import { rankHighlights } from './scoring.js';
+import { detectMotion } from './motion.js';
+import { buildSignalTimeline, rankHighlights } from './scoring.js';
 import { getTranscript } from './transcribe.js';
 import { assertAllowedFile } from './security.js';
 
@@ -55,6 +56,35 @@ export async function analyseVideo({
       warnings.push(`transcription unavailable: ${shortError(error)}`);
     }
 
+    let motion = { sampleRate: config.motionSampleRate, frameCount: 0, threshold: null, metrics: [], events: [], peaks: [] };
+    if (config.motionEnabled && metadata.video) {
+      try {
+        motion = await detectMotion(source.path, metadata.durationSeconds, config, onProgress);
+      } catch (error) {
+        warnings.push(`motion analysis unavailable: ${shortError(error)}`);
+      }
+    }
+
+    const enabledSignals = ['transcript', 'audio_relative_burst', 'scene_boundary'];
+    if (config.motionEnabled && metadata.video) enabledSignals.push('motion_low_weight');
+
+    const signalTimeline = buildSignalTimeline({
+      durationSeconds: metadata.durationSeconds,
+      metrics,
+      scenes,
+      cues: transcript.cues,
+      style,
+      keywords,
+      motion: motion.metrics,
+    });
+    const signalTimelinePath = join(workDir, 'signal-timeline.json');
+    await writeFile(signalTimelinePath, JSON.stringify({
+      schema: 'premiere-highlight-signal-timeline/v1',
+      resolutionSeconds: 1,
+      enabled: enabledSignals,
+      bins: signalTimeline,
+    }, null, 2), 'utf8');
+
     onProgress?.(97, 'ranking highlight candidates');
     const candidates = rankHighlights({
       durationSeconds: metadata.durationSeconds,
@@ -63,6 +93,7 @@ export async function analyseVideo({
       cues: transcript.cues,
       style,
       keywords,
+      motion: motion.metrics,
       clipLengthSeconds,
       maxCandidates: Math.min(maxCandidates, config.maxCandidates),
     });
@@ -74,7 +105,7 @@ export async function analyseVideo({
       engine: {
         name: 'premiere-highlight-mcp',
         version: '0.1.0',
-        scoring: 'transparent-heuristic-v1',
+        scoring: 'transparent-heuristic-v2',
       },
       source: {
         path: source.path,
@@ -88,6 +119,9 @@ export async function analyseVideo({
         style,
         keywords,
         sceneThreshold: config.sceneThreshold,
+        motionEnabled: config.motionEnabled,
+        motionSampleRate: config.motionSampleRate,
+        motionDiffThreshold: config.motionDiffThreshold,
       },
       transcript: {
         source: transcript.source,
@@ -97,13 +131,22 @@ export async function analyseVideo({
         cues: transcript.cues,
       },
       signals: {
+        enabled: enabledSignals,
+        timelineResolutionSeconds: 1,
+        timelineBinCount: signalTimeline.length,
         audioBucketCount: metrics.length,
         sceneChangeCount: scenes.length,
         sceneChangeSeconds: scenes,
+        motionSampleRate: motion.sampleRate,
+        motionFrameCount: motion.frameCount,
+        motionThreshold: motion.threshold,
+        motionEventCount: motion.events.length,
+        motionEvents: motion.events,
+        motionPeakSeconds: motion.peaks,
       },
       candidates,
       warnings,
-      artifacts: { analysisJson: resultPath },
+      artifacts: { analysisJson: resultPath, signalTimeline: signalTimelinePath },
     };
     await writeFile(resultPath, JSON.stringify(result, null, 2), 'utf8');
     onProgress?.(100, 'analysis complete');

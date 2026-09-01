@@ -121,11 +121,16 @@ export function buildServer(config, state = { jobs: new Map(), queue: Promise.re
       model: config.asrModel,
       localRuntimeConfigured: Boolean(config.transformersRuntime),
     },
+    scoring: {
+      enabledSignals: ['transcript', 'audio_relative_burst', 'scene_boundary', ...(config.motionEnabled ? ['motion_low_weight'] : [])],
+      motionEnabled: config.motionEnabled,
+      motionSampleRate: config.motionSampleRate,
+    },
     workflow: ['analyze_video', 'get_analysis_status', 'export_premiere_plan', 'get_frame'],
   }));
 
   server.registerTool('analyze_video', {
-    description: 'Queue a local video analysis. It combines audio energy, scene changes, sidecar captions, and optionally the cached local Whisper/Transformers model to rank timestamped highlight candidates. It never changes Premiere.',
+    description: 'Queue a local video analysis. It combines local transcript/ASR, relative audio bursts, scene boundaries, and optional low-weight frame-difference motion to rank timestamped highlight candidates with evidence. It never changes Premiere.',
     inputSchema: {
       video_path: z.string().describe('Absolute local path to the source video.'),
       clip_length_seconds: z.number().int().min(10).max(600).default(45).describe('Target duration for each highlight clip.'),

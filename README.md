@@ -17,7 +17,16 @@
 - FFmpeg：逐秒 RMS/peak 音訊能量與 scene-change 訊號。
 - 字幕：優先讀取影片同名 `.srt` 或 `.vtt` sidecar。
 - ASR：沒有 sidecar 時可使用已快取的本機 Transformers Whisper 模型；設定檔預設使用 `auto`，不會在剪輯時自動下載模型。
-- 評分：以透明的 heuristic 組合音訊、說話密度、興奮詞、標點與畫面切換；每個候選會回傳 evidence，而不是只給黑箱分數。
+- 評分：以透明的 heuristic 組合 transcript/ASR、逐秒 audio energy、相對局部音訊 burst、scene boundary 與低權重 frame-difference motion；每個候選會回傳 evidence，而不是只給黑箱分數。完整的一秒 signal timeline 會寫入分析快取，供檢查與重新排序。
+
+## 預設 scoring profile
+
+- transcript/ASR 是主要語意訊號；保留 cue timestamp、短引文、說話覆蓋率、語句密度與興奮詞證據。
+- audio burst 以影片內 rolling local baseline/MAD 衡量，不使用固定的 dB 閾值。
+- scene change 主要用來偏好乾淨的剪輯起訖點；motion 只作低權重的輔助訊號。
+- objects/actions 不會預設啟用，除非內容設定指定目標標籤且本機 detector 可用。
+
+Motion 預設啟用但可用 `HIGHLIGHT_MOTION_ENABLED=false` 關閉；`HIGHLIGHT_MOTION_SAMPLE_RATE` 預設為每秒 1 個低解析度影格，`HIGHLIGHT_MOTION_DIFF_THRESHOLD` 預設為 `0.08`。
 
 ## 安全預設
 

@@ -21,6 +21,11 @@ function positiveNumber(value, fallback) {
   return Number.isFinite(number) && number > 0 ? number : fallback;
 }
 
+function booleanValue(value, fallback) {
+  if (value === undefined || value === null || value === '') return fallback;
+  return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
+}
+
 /**
  * Configuration is intentionally explicit. The server does not search the
  * whole machine for media and does not start a network listener.
@@ -48,6 +53,9 @@ export function loadConfig(env = process.env, cwd = process.cwd()) {
     ffmpegBin: env.HIGHLIGHT_FFMPEG_BIN ?? 'ffmpeg',
     ffprobeBin: env.HIGHLIGHT_FFPROBE_BIN ?? 'ffprobe',
     sceneThreshold: positiveNumber(env.HIGHLIGHT_SCENE_THRESHOLD, 0.35),
+    motionEnabled: booleanValue(env.HIGHLIGHT_MOTION_ENABLED, true),
+    motionSampleRate: Math.min(2, positiveNumber(env.HIGHLIGHT_MOTION_SAMPLE_RATE, 1)),
+    motionDiffThreshold: positiveNumber(env.HIGHLIGHT_MOTION_DIFF_THRESHOLD, 0.08),
     maxVideoBytes: positiveNumber(env.HIGHLIGHT_MAX_VIDEO_BYTES, 200 * 1024 * 1024 * 1024),
     maxDurationSeconds: positiveNumber(env.HIGHLIGHT_MAX_DURATION_SECONDS, 12 * 60 * 60),
     asrMode,

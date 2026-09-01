@@ -29,6 +29,35 @@ function quantile(values, percentile) {
   return sorted[lower] + (sorted[upper] - sorted[lower]) * (index - lower);
 }
 
+function roundSignal(value) {
+  return Math.round(clamp(Number(value) || 0) * 100) / 100;
+}
+
+function dbFromRms(value) {
+  return 20 * Math.log10(Math.max(Number(value) || 0, 1e-7));
+}
+
+function buildAudioProfile(metrics = []) {
+  const rmsValues = metrics.map((metric) => Number(metric.rms) || 0);
+  const dbValues = rmsValues.map(dbFromRms);
+  const baselineRms = quantile(rmsValues, 0.5);
+  const upperRms = Math.max(quantile(rmsValues, 0.95), baselineRms + 1e-5);
+  const radius = 8;
+  const signals = metrics.map((metric, index) => {
+    const localValues = dbValues.slice(Math.max(0, index - radius), Math.min(dbValues.length, index + radius + 1));
+    const localMedian = quantile(localValues, 0.5);
+    const mad = quantile(localValues.map((value) => Math.abs(value - localMedian)), 0.5);
+    const zScore = (dbValues[index] - localMedian) / Math.max(1.4826 * mad, 1);
+    return {
+      energy: clamp((rmsValues[index] - baselineRms) / Math.max(upperRms - baselineRms, 1e-5)),
+      peak: clamp(((Number(metric.peak) || 0) - baselineRms) / Math.max(upperRms - baselineRms, 1e-5)),
+      burst: clamp((zScore - 1) / 3),
+      zScore,
+    };
+  });
+  return { baselineRms, upperRms, signals };
+}
+
 function textUnits(text) {
   const words = text.match(/[\p{L}\p{N}]+(?:['’_-][\p{L}\p{N}]+)*/gu)?.length ?? 0;
   const cjk = text.match(/[\u3400-\u9fff]/g)?.length ?? 0;
@@ -67,17 +96,28 @@ function overlapSeconds(cue, start, end) {
   return Math.max(0, Math.min(cue.endSeconds, end) - Math.max(cue.startSeconds, start));
 }
 
-function metricStats(metrics, start, end, baseline, upper) {
-  const selected = metrics.filter((metric) => metric.startSeconds < end && metric.startSeconds + metric.durationSeconds > start);
-  if (!selected.length) return { energy: 0, peak: 0, averageRms: 0, selected: [] };
-  const averageRms = selected.reduce((sum, metric) => sum + metric.rms, 0) / selected.length;
-  const peak = Math.max(...selected.map((metric) => metric.peak));
+function metricStats(metrics, start, end, audioProfile) {
+  const selected = metrics
+    .map((metric, index) => ({ metric, index }))
+    .filter(({ metric }) => metric.startSeconds < end && metric.startSeconds + metric.durationSeconds > start);
+  if (!selected.length) return { energy: 0, peak: 0, burst: 0, averageRms: 0, selected: [] };
+  const averageRms = selected.reduce((sum, item) => sum + (Number(item.metric.rms) || 0), 0) / selected.length;
+  const peak = Math.max(...selected.map((item) => Number(item.metric.peak) || 0));
+  const baseline = audioProfile?.baselineRms ?? 0;
+  const upper = audioProfile?.upperRms ?? Math.max(baseline + 1e-5, 1e-5);
   const averageEnergy = clamp((averageRms - baseline) / Math.max(upper - baseline, 1e-5));
   const peakEnergy = clamp((peak - baseline) / Math.max(upper - baseline, 1e-5));
-  return { energy: clamp(averageEnergy * 0.65 + peakEnergy * 0.35), peak: peakEnergy, averageRms, selected };
+  const burst = Math.max(...selected.map((item) => audioProfile?.signals?.[item.index]?.burst ?? 0));
+  return {
+    energy: clamp(averageEnergy * 0.65 + peakEnergy * 0.35),
+    peak: peakEnergy,
+    burst,
+    averageRms,
+    selected: selected.map((item) => item.metric),
+  };
 }
 
-function windowStats(start, end, metrics, scenes, cues, style, keywords, audioBaseline, audioUpper) {
+function transcriptStats(start, end, cues, style, keywords) {
   const duration = Math.max(end - start, 0.001);
   const transcriptCues = cues.filter((cue) => cue.startSeconds < end && cue.endSeconds > start);
   const quote = transcriptCues.map((cue) => cue.text).join(' ').replace(/\s+/g, ' ').trim();
@@ -87,19 +127,50 @@ function windowStats(start, end, metrics, scenes, cues, style, keywords, audioBa
   const speakingRate = clamp(words / Math.max(duration * 2.4, 1));
   const excitement = excitementScore(quote, style, keywords);
   const punctuation = clamp(((quote.match(/[!！?？]/g) ?? []).length / Math.max(words, 1)) * 2.5);
-  const audio = metricStats(metrics, start, end, audioBaseline, audioUpper);
+  const hasTranscript = transcriptCues.length > 0;
+  const signal = hasTranscript
+    ? clamp(excitement.score * 0.55 + speechDensity * 0.20 + speakingRate * 0.15 + punctuation * 0.10)
+    : 0;
+  return { transcriptCues, quote, words, speechDensity, speakingRate, excitement, punctuation, hasTranscript, signal };
+}
+
+function sceneStats(start, end, scenes) {
   const sceneCount = scenes.filter((time) => time >= start && time <= end).length;
   const sceneScore = clamp(sceneCount / 3);
-  const hasTranscript = cues.length > 0;
+  const boundaryTolerance = Math.min(3, Math.max(1.5, (end - start) * 0.08));
+  const sceneBoundary = scenes.some((time) => Math.min(Math.abs(time - start), Math.abs(time - end)) <= boundaryTolerance) ? 1 : 0;
+  return { sceneCount, sceneScore, sceneBoundary };
+}
+
+function motionStats(start, end, motion = []) {
+  const selected = motion.filter((metric) => metric.startSeconds < end && metric.startSeconds + (metric.durationSeconds || 1) > start);
+  if (!selected.length) return { energy: 0, eventCount: 0, peakCount: 0 };
+  return {
+    energy: Math.max(...selected.map((metric) => clamp(Number(metric.score ?? metric.energy) || 0))),
+    eventCount: selected.filter((metric) => metric.event).length,
+    peakCount: selected.filter((metric) => metric.peak).length,
+  };
+}
+
+function windowStats(start, end, metrics, scenes, cues, style, keywords, audioProfile, motion) {
+  const transcript = transcriptStats(start, end, cues, style, keywords);
+  const scene = sceneStats(start, end, scenes);
+  const audio = metricStats(metrics, start, end, audioProfile);
+  const visualMotion = motionStats(start, end, motion);
+  const { quote, speechDensity, speakingRate, excitement, punctuation, hasTranscript } = transcript;
+  const { sceneCount, sceneScore, sceneBoundary } = scene;
   const score = hasTranscript
-    ? 100 * (audio.energy * 0.30 + excitement.score * 0.34 + speechDensity * 0.16 + speakingRate * 0.08 + sceneScore * 0.07 + punctuation * 0.05)
-    : 100 * (audio.energy * 0.62 + sceneScore * 0.23 + punctuation * 0.15);
+    ? 100 * (audio.energy * 0.22 + audio.burst * 0.08 + excitement.score * 0.30 + speechDensity * 0.13 + speakingRate * 0.07 + sceneScore * 0.06 + sceneBoundary * 0.04 + punctuation * 0.05 + visualMotion.energy * 0.05)
+    : 100 * (audio.energy * 0.43 + audio.burst * 0.17 + sceneScore * 0.18 + sceneBoundary * 0.08 + visualMotion.energy * 0.14 + punctuation * 0.00);
   const reasons = [];
   if (audio.energy >= 0.55) reasons.push(`音訊能量高於片段基線（${Math.round(audio.energy * 100)}%）`);
+  if (audio.burst >= 0.45) reasons.push(`音訊相對於局部基準突然上升（${Math.round(audio.burst * 100)}%）`);
   if (excitement.matches.length) reasons.push(`字幕出現 ${excitement.matches.slice(0, 3).join('、')}`);
   if (speechDensity >= 0.65) reasons.push('說話覆蓋率高');
   if (speakingRate >= 0.65) reasons.push('語句密度高');
-  if (sceneCount) reasons.push(`偵測到 ${sceneCount} 個畫面切換`);
+  if (sceneBoundary) reasons.push('片段起點或終點靠近畫面切換');
+  else if (sceneCount) reasons.push(`偵測到 ${sceneCount} 個畫面切換`);
+  if (visualMotion.energy >= 0.55) reasons.push(`畫面動態變化明顯（${Math.round(visualMotion.energy * 100)}%）`);
   if (punctuation >= 0.45) reasons.push('字幕有明顯驚嘆或提問');
   if (!hasTranscript) reasons.push('未取得字幕；此候選主要依音訊與畫面切換評分');
   return {
@@ -109,10 +180,16 @@ function windowStats(start, end, metrics, scenes, cues, style, keywords, audioBa
     evidence: {
       audioEnergy: Math.round(audio.energy * 100) / 100,
       audioPeak: Math.round(audio.peak * 100) / 100,
+      audioBurst: roundSignal(audio.burst),
+      transcriptSignal: roundSignal(transcript.signal),
       speechDensity: Math.round(speechDensity * 100) / 100,
       speakingRate: Math.round(speakingRate * 100) / 100,
       excitement: Math.round(excitement.score * 100) / 100,
       sceneChanges: sceneCount,
+      sceneBoundary: roundSignal(sceneBoundary),
+      motionEnergy: roundSignal(visualMotion.energy),
+      motionEvents: visualMotion.eventCount,
+      motionPeaks: visualMotion.peakCount,
       punctuation: Math.round(punctuation * 100) / 100,
     },
   };
@@ -123,14 +200,93 @@ function overlapRatio(left, right) {
   return overlap / Math.min(left.endSeconds - left.startSeconds, right.endSeconds - right.startSeconds);
 }
 
+/** Build a compact one-second evidence timeline for debugging and re-ranking. */
+export function buildSignalTimeline({ durationSeconds, metrics = [], scenes = [], cues = [], style = '', keywords = [], motion = [] }) {
+  const duration = Math.max(0, Number(durationSeconds) || 0);
+  const binCount = Math.ceil(duration);
+  const audioProfile = buildAudioProfile(metrics);
+  const timeline = Array.from({ length: binCount }, (_, index) => ({
+    startSeconds: index,
+    endSeconds: Math.min(duration, index + 1),
+    audioEnergy: 0,
+    audioPeak: 0,
+    audioBurst: 0,
+    transcriptSignal: 0,
+    speechDensity: 0,
+    sceneBoundary: 0,
+    motionEnergy: 0,
+    motionEvent: 0,
+    motionPeak: 0,
+  }));
+
+  for (const [index, metric] of metrics.entries()) {
+    const bin = Math.floor(Number(metric.startSeconds) || 0);
+    if (bin < 0 || bin >= timeline.length) continue;
+    const signal = audioProfile.signals[index] ?? {};
+    timeline[bin].audioEnergy = Math.max(timeline[bin].audioEnergy, signal.energy ?? 0);
+    timeline[bin].audioPeak = Math.max(timeline[bin].audioPeak, signal.peak ?? 0);
+    timeline[bin].audioBurst = Math.max(timeline[bin].audioBurst, signal.burst ?? 0);
+  }
+
+  const transcriptBins = timeline.map(() => ({ speechSeconds: 0, words: 0, punctuation: 0, excitement: 0 }));
+  for (const cue of cues) {
+    const cueStart = Number(cue.startSeconds);
+    const cueEnd = Number(cue.endSeconds);
+    if (!Number.isFinite(cueStart) || !Number.isFinite(cueEnd) || cueEnd <= cueStart) continue;
+    const cueDuration = cueEnd - cueStart;
+    const cueWords = textUnits(cue.text);
+    const cuePunctuation = (String(cue.text ?? '').match(/[!！?？]/g) ?? []).length;
+    const cueExcitement = excitementScore(cue.text, style, keywords).score;
+    const firstBin = Math.max(0, Math.floor(cueStart));
+    const lastBin = Math.min(timeline.length - 1, Math.ceil(cueEnd) - 1);
+    for (let bin = firstBin; bin <= lastBin; bin += 1) {
+      const overlap = Math.max(0, Math.min(cueEnd, bin + 1) - Math.max(cueStart, bin));
+      if (!overlap) continue;
+      const contribution = overlap / cueDuration;
+      transcriptBins[bin].speechSeconds += overlap;
+      transcriptBins[bin].words += cueWords * contribution;
+      transcriptBins[bin].punctuation += cuePunctuation * contribution;
+      transcriptBins[bin].excitement = Math.max(transcriptBins[bin].excitement, cueExcitement);
+    }
+  }
+  for (const [index, values] of transcriptBins.entries()) {
+    const density = clamp(values.speechSeconds / Math.max(timeline[index].endSeconds - timeline[index].startSeconds, 0.001));
+    const speakingRate = clamp(values.words / 2.4);
+    const punctuation = clamp((values.punctuation / Math.max(values.words, 1)) * 2.5);
+    timeline[index].speechDensity = density;
+    timeline[index].transcriptSignal = clamp(values.excitement * 0.55 + density * 0.20 + speakingRate * 0.15 + punctuation * 0.10);
+  }
+
+  for (const scene of scenes) {
+    const bin = Math.round(Number(scene) || 0);
+    if (bin >= 0 && bin < timeline.length) timeline[bin].sceneBoundary = 1;
+  }
+  for (const metric of motion) {
+    const bin = Math.floor(Number(metric.startSeconds) || 0);
+    if (bin < 0 || bin >= timeline.length) continue;
+    timeline[bin].motionEnergy = Math.max(timeline[bin].motionEnergy, clamp(Number(metric.score ?? metric.energy) || 0));
+    if (metric.event) timeline[bin].motionEvent = 1;
+    if (metric.peak) timeline[bin].motionPeak = 1;
+  }
+  return timeline.map((bin) => ({
+    ...bin,
+    audioEnergy: roundSignal(bin.audioEnergy),
+    audioPeak: roundSignal(bin.audioPeak),
+    audioBurst: roundSignal(bin.audioBurst),
+    transcriptSignal: roundSignal(bin.transcriptSignal),
+    speechDensity: roundSignal(bin.speechDensity),
+    sceneBoundary: roundSignal(bin.sceneBoundary),
+    motionEnergy: roundSignal(bin.motionEnergy),
+  }));
+}
+
 /**
  * Rank windows using transparent local signals. This is intentionally not a
  * black-box claim of semantic truth: every score is returned with evidence.
  */
-export function rankHighlights({ durationSeconds, metrics = [], scenes = [], cues = [], style = '', keywords = [], clipLengthSeconds = 45, maxCandidates = 10 }) {
+export function rankHighlights({ durationSeconds, metrics = [], scenes = [], cues = [], style = '', keywords = [], motion = [], clipLengthSeconds = 45, maxCandidates = 10 }) {
   const length = Math.min(Math.max(Number(clipLengthSeconds) || 45, 10), Math.max(10, durationSeconds));
-  const baseline = quantile(metrics.map((metric) => metric.rms), 0.5);
-  const upper = Math.max(quantile(metrics.map((metric) => metric.rms), 0.95), baseline + 1e-5);
+  const audioProfile = buildAudioProfile(metrics);
   const starts = new Set();
   const addStart = (value) => {
     const start = Math.max(0, Math.min(Math.max(0, durationSeconds - length), Number(value) || 0));
@@ -139,9 +295,15 @@ export function rankHighlights({ durationSeconds, metrics = [], scenes = [], cue
 
   if (durationSeconds <= length + 0.01) addStart(0);
   const peakMetrics = [...metrics]
-    .sort((left, right) => (right.rms + right.peak * 0.35) - (left.rms + left.peak * 0.35))
+    .map((metric, index) => ({ metric, index }))
+    .sort((left, right) => {
+      const leftSignal = audioProfile.signals[left.index] ?? {};
+      const rightSignal = audioProfile.signals[right.index] ?? {};
+      return (right.metric.rms + right.metric.peak * 0.35 + (rightSignal.burst ?? 0) * 0.25)
+        - (left.metric.rms + left.metric.peak * 0.35 + (leftSignal.burst ?? 0) * 0.25);
+    })
     .slice(0, 80);
-  for (const metric of peakMetrics) addStart(metric.startSeconds - length * 0.38);
+  for (const { metric } of peakMetrics) addStart(metric.startSeconds - length * 0.38);
   for (const cue of cues) addStart(cue.startSeconds - length * 0.12);
   for (const scene of scenes.slice(0, 500)) addStart(scene - length * 0.3);
 
@@ -151,7 +313,7 @@ export function rankHighlights({ durationSeconds, metrics = [], scenes = [], cue
 
   const ranked = [...starts].map((start) => {
     const end = Math.min(durationSeconds, start + length);
-    const stats = windowStats(start, end, metrics, scenes, cues, style, keywords, baseline, upper);
+    const stats = windowStats(start, end, metrics, scenes, cues, style, keywords, audioProfile, motion);
     return {
       startSeconds: Math.round(start * 1000) / 1000,
       endSeconds: Math.round(end * 1000) / 1000,

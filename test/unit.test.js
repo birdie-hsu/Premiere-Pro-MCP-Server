@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { parseCaptionText } from '../src/captions.js';
 import { buildPremierePlan, buildPremiereXml } from '../src/premiere-xml.js';
-import { rankHighlights } from '../src/scoring.js';
+import { buildSignalTimeline, rankHighlights } from '../src/scoring.js';
 import { isWithin } from '../src/security.js';
 
 test('parses SRT and VTT-style timestamps, including CJK captions', () => {
@@ -39,6 +39,29 @@ test('ranks an audio/transcript burst above quiet windows', () => {
   assert.ok(candidates[0].score > 40);
   assert.ok(candidates[0].reasons.length > 0);
   assert.ok(candidates[0].evidence.excitement > 0);
+});
+
+test('builds one-second transcript, relative audio, scene, and motion evidence', () => {
+  const metrics = Array.from({ length: 30 }, (_, index) => ({
+    startSeconds: index,
+    durationSeconds: 1,
+    rms: index === 10 ? 0.9 : 0.12,
+    peak: index === 10 ? 1 : 0.2,
+  }));
+  const timeline = buildSignalTimeline({
+    durationSeconds: 30,
+    metrics,
+    scenes: [10],
+    cues: [{ startSeconds: 10, endSeconds: 11, text: 'No way! That was insane!' }],
+    style: 'gaming',
+    motion: [{ startSeconds: 10, durationSeconds: 1, score: 0.8, event: true, peak: true }],
+  });
+  assert.equal(timeline.length, 30);
+  assert.ok(timeline[10].audioBurst > 0.5);
+  assert.ok(timeline[10].transcriptSignal > 0.3);
+  assert.equal(timeline[10].sceneBoundary, 1);
+  assert.equal(timeline[10].motionEvent, 1);
+  assert.equal(timeline[10].motionPeak, 1);
 });
 
 test('allowlist containment rejects traversal outside the root', () => {
