@@ -1,0 +1,18 @@
+{
+  "name": "premiere-highlight-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local-first MCP for finding livestream highlights and handing them off to Premiere Pro.",
+  "type": "module",
+  "bin": {
+    "premiere-highlight-mcp": "src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "zod": "3.25.76"
+  }
+}
