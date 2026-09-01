@@ -1,6 +1,6 @@
 ---
 name: local-livestream-premiere
-description: Analyze local livestreams with ASR-first evidence, select viral or product highlights, and assemble non-destructive Adobe Premiere Pro sequences through local CEP MCP servers; never use UXP or cloud services.
+description: Configure three local MCP servers, analyze local livestreams with ASR-first evidence, select viral or product highlights, and assemble non-destructive Adobe Premiere Pro sequences through CEP; never use UXP or cloud services.
 metadata:
   hermes:
     category: media
@@ -21,6 +21,46 @@ Use this skill when the user wants a local livestream searched for product infor
 - Saving the current `.prproj` overwrites the existing project file. Ask for explicit approval immediately before `save_project`; prefer Save As when the user gives a new path.
 - Do not overwrite an existing export or plan file unless the user explicitly requests it.
 
+## Environment bootstrap (read this section before using the workflow)
+
+This skill is intended to be sufficient to configure the local environment. The canonical Hermes configuration for this repository is the project-scoped `<REPO_ROOT>\.codex\config.toml` in TOML format. Do not create a YAML `config.yaml` for this project and do not assume that merely listing the three server names registers them.
+
+When any server is missing or the project has not been set up, resolve:
+
+- `<REPO_ROOT>`: the folder containing `package.json` and `src\index.js`;
+- `<VIDEO_ROOT>`: the user's absolute local video folder;
+- `<HERMES_ROOT>`: normally `%LOCALAPPDATA%\hermes`;
+- local tools: `<REPO_ROOT>\tools\bin\ffmpeg.exe`, `ffprobe.exe`, and `yt-dlp.exe`.
+
+Run the repository bootstrap script with the user's actual video folder:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File "<REPO_ROOT>\hermes-skills\media\local-livestream-premiere\scripts\ensure-hermes-config.ps1" -VideoRoot "<VIDEO_ROOT>" -Apply
+```
+
+The script validates the Hermes Node runtime, the three local entrypoints, and the bundled FFmpeg/FFprobe/yt-dlp tools; writes/merges `<REPO_ROOT>\.codex\config.toml`, preserves unrelated settings, and backs up an existing project config before applying the managed server block. It registers exactly:
+
+Only use `-Apply` when the user has requested environment setup or explicitly approved writing the project config. For an analysis-only request, run the script in preview mode or report the missing setup instead.
+
+| Server | Local entrypoint | Purpose |
+|---|---|---|
+| `video_context` | Hermes Node + `@smallthinkingmachines\video-context-mcp\dist\index.js` | transcript, timeline, search, keyframes/OCR; local FFmpeg/FFprobe/yt-dlp |
+| `highlight_local` | `<REPO_ROOT>\src\index.js` | local audio/scene/motion/transcript scoring and JSON/FCP7 handoff |
+| `premiere_cep` | Hermes Node + `adobe-premiere-pro-mcp\dist\index.js` | Premiere CEP connection and non-destructive assembly |
+
+The generated environment also points both analysis servers at the local FFmpeg/FFprobe binaries, local cache directories, and the bundled Transformers runtime. `<VIDEO_ROOT>` is added to `HIGHLIGHT_ALLOWED_ROOTS`; never widen the allowlist to the whole machine. Do not commit the generated `.codex` config, cache, media, or user-specific paths.
+
+After applying the config, start a fresh Hermes session and verify all three servers:
+
+```powershell
+hermes mcp list
+hermes mcp test video_context
+hermes mcp test highlight_local
+hermes mcp test premiere_cep
+```
+
+`premiere_cep` requires the Adobe Premiere CEP bridge panel to be open. If a required executable, package entrypoint, FFmpeg binary, or ASR runtime is missing, report the exact missing path and stop setup; do not substitute UXP, raw ExtendScript, cloud processing, or a network listener.
+
 ## Default local scoring profile
 
 - Keep transcript/ASR as the primary semantic signal. Preserve cue timestamps, short quotes, speech coverage, speaking rate, excitement terms, and punctuation evidence; treat noisy ASR as an approximation.
@@ -39,13 +79,13 @@ Hermes registers MCP tools as `mcp_<server_name>_<tool_name>`. The expected serv
 - `highlight_local`: `server_info`, `analyze_video`, `get_analysis_status`, `get_frame`, and optionally `export_premiere_plan`.
 - `premiere_cep`: `verify_premiere_connection`, `import_media`, `duplicate_sequence`, `add_to_timeline_batch`, `add_marker`, `set_active_sequence`, `list_sequence_tracks`, `validate_project_for_export`, plus `save_project`/export tools only when the user asks to persist or render.
 
-If a tool is not exposed, report the missing server/tool and continue only with a safe, clearly labeled fallback. Do not replace CEP with UXP.
+All three server registrations are required for the complete workflow. If a tool is not exposed, run the bootstrap/verification checks first, then report the missing server/tool and continue only with a safe, clearly labeled fallback. Do not replace CEP with UXP.
 
 ## Default runbook
 
 1. Confirm the absolute local video path and the requested cut style/length. If either materially changes the result and cannot be inferred, ask before analysis.
 2. Follow [references/operational-playbook.md](references/operational-playbook.md) for the low-token ASR search, candidate scoring, review gate, and Premiere assembly.
-3. For Hermes setup or missing tools, read [references/mcp-setup-windows.md](references/mcp-setup-windows.md). Merge its MCP block into the existing Hermes config; never replace the whole config.
+3. If any MCP server is not already available, run the Environment bootstrap above. Read [references/mcp-setup-windows.md](references/mcp-setup-windows.md) only for troubleshooting or non-default Hermes locations; it must agree with the generated TOML config.
 4. Return an analysis table containing ID, source start/end, duration, score, reason, short quote or visual cue, and evidence limitations. Include transcript, audio burst, scene boundary, and motion evidence when available.
 5. Stop after the candidate table until the user approves. “Analyze” alone is not permission to mutate Premiere; “use candidates V-02, V-05” or an equivalent explicit instruction is.
 6. After approval, verify CEP, assemble the approved ranges in a new/duplicated sequence, add navigation markers, set the new sequence active, and verify tracks, gaps, offline media, and duration.
