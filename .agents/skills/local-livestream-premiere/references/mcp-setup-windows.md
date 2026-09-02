@@ -1,4 +1,4 @@
-# 全新 Windows 機器部署 'local-livestream-premiere'
+# 全新 Windows 機器部署 local-livestream-premiere
 
 本文件把「全新機器 → Hermes → 三個本地 MCP → Premiere Pro CEP 剪輯」整理成
 可重複執行的部署流程。部署完成後，Hermes agent 可以讀取本 skill，分析本地
@@ -20,9 +20,10 @@ livestream，並在使用者明確核准後把片段組成 Premiere sequence。
 
 1. Hermes 找得到並啟用 'local-livestream-premiere' skill。
 2. project-scoped <REPO_ROOT>\.codex\config.toml 已註冊三個 server。
-3. 三個 'hermes mcp test' 都能通過連線測試。
-4. Premiere Pro 已安裝並能開啟 CEP bridge panel。
-5. 影片、轉錄、cache、分析結果和暫存檔都留在本機。
+3. 三個 'hermes mcp test' 都能啟動 stdio process；這不等於 Premiere live connection。
+4. 'get_capabilities(checkConnection=false)' 能確認 CEP 安裝狀態。
+5. Premiere CEP panel 已 Started/Connected，且 'verify_premiere_connection' 成功；activeSequence 可以是 null。
+6. 影片、轉錄、cache、分析結果和暫存檔都留在本機。
 
 只複製 repository 再讀取 skill 不足以完成全新機器部署。Skill 會自動化設定與
 檢查，但不會替代一次性的主機 provisioning。
@@ -42,7 +43,7 @@ $HermesRoot = Join-Path $env:LOCALAPPDATA 'hermes'
 | 項目 | 用途 | 檢查 |
 |---|---|---|
 | Git | 取得 repository | 'git --version' |
-| Node.js/npm | 安裝與測試本地 MCP | 'node --version'、'npm --version' |
+| Node.js 22+/npm | 安裝與測試本地 MCP；video_context 要求 Node 22 | 'node --version'、'npm --version' |
 | Hermes agent | skill discovery、MCP 啟動和 tool routing | 'hermes --version' |
 | Adobe Premiere Pro | 匯入影片與編輯 sequence | 啟動應用程式 |
 | Premiere CEP bridge | 讓 'premiere_cep' 連到 Premiere | 安裝並開啟 bridge panel |
@@ -58,14 +59,15 @@ hermes --version
 Test-Path -LiteralPath $VideoRoot -PathType Container
 ~~~
 
-若 'hermes' 找不到，先安裝 Hermes 並讓它加入目前使用者的 PATH。若 Premiere
-或 CEP bridge 尚未安裝，先完成安裝；不要用 UXP、raw ExtendScript、cloud
-video service 或 network listener 代替 CEP。
+若 'hermes' 找不到，先完成 'hermes setup' 或組織核准的 Hermes 安裝流程，並讓
+它加入目前使用者的 PATH。Premiere 必須透過 Adobe 官方方式安裝；CEP extension
+會在第 6 節以明確 opt-in 安裝。不要用 UXP、raw ExtendScript、cloud video
+service 或 network listener 代替 CEP。
 
 ## 1. 取得 repository 並安裝本地 server
 
 ~~~powershell
-git clone '<REPOSITORY_URL>' $RepoRoot
+git clone 'https://github.com/birdie-hsu/Premiere-Pro-MCP-Server.git' $RepoRoot
 Set-Location -LiteralPath $RepoRoot
 npm ci
 npm test
@@ -80,7 +82,7 @@ npm test
 ~~~text
 <REPO_ROOT>\package.json
 <REPO_ROOT>\src\index.js
-<REPO_ROOT>\hermes-skills\media\local-livestream-premiere\SKILL.md
+<REPO_ROOT>\.agents\skills\local-livestream-premiere\SKILL.md
 ~~~
 
 ## 2. 準備本地媒體工具
@@ -132,6 +134,19 @@ $ToolPaths | ForEach-Object {
 版本安裝到同一個 Hermes Node 'node_modules' tree。不要只把 package 裝到
 repository 的 'node_modules'，因為 bootstrap 會用 Hermes Node 啟動 entrypoint。
 
+若 Hermes Node tree 確實缺少 package，且使用者已核准從 npm registry 下載，可
+安裝本 repository 驗證過的 baseline；這只下載 runtime package，不會上傳影片：
+
+~~~powershell
+$HermesNodeRoot = Join-Path $HermesRoot 'node'
+$HermesNpm = Join-Path $HermesNodeRoot 'npm.cmd'
+& $HermesNpm install --prefix $HermesNodeRoot --no-save --package-lock=false `
+    '@smallthinkingmachines/video-context-mcp@0.8.0' `
+    'adobe-premiere-pro-mcp@1.2.5'
+~~~
+
+版本升級應視為獨立變更，閱讀 upstream release notes 後重跑本文件全部驗證。
+
 本地 ASR 需要 Transformers runtime 與可用的 model cache。若新機器沒有 cache，
 先在允許下載模型的 provisioning 階段完成模型準備；影片本身仍必須是本地檔案。
 若暫時沒有 ASR runtime，可以使用本地 '.srt' 或 '.vtt' sidecar 作為明確 fallback，
@@ -156,26 +171,42 @@ $HermesChecks | ForEach-Object {
 如果 Hermes 不在 '%LOCALAPPDATA%\hermes'，保留實際安裝位置，稍後以
 '-HermesRoot <實際路徑>' 傳給 bootstrap；不需要複製或改名 runtime。
 
+若新機器尚未 cache ASR/OCR model，經使用者核准網路下載後可預先準備。以下
+cache 路徑與 bootstrap 生成的 config 一致：
+
+~~~powershell
+$VideoContextCli = Join-Path $HermesNodeRoot 'video-context-mcp.cmd'
+$env:VCM_CACHE_DIR = Join-Path $RepoRoot '.cache\video-context-mcp'
+$env:VCM_TOOLCHAIN_MODE = 'system'
+$env:VCM_FFMPEG_BIN = Join-Path $RepoRoot 'tools\bin\ffmpeg.exe'
+$env:VCM_FFPROBE_BIN = Join-Path $RepoRoot 'tools\bin\ffprobe.exe'
+$env:VCM_YTDLP_BIN = Join-Path $RepoRoot 'tools\bin\yt-dlp.exe'
+$env:VCM_OCR_BACKEND = 'wasm'
+$env:VCM_ASR_BACKEND = 'transformers'
+$env:VCM_ASR_MODEL = 'Xenova/whisper-base.en'
+& $VideoContextCli setup --all
+& $VideoContextCli doctor --json
+~~~
+
+若要使用多語 model，把 'VCM_ASR_MODEL' 與第 5 節的 '-AsrModel' 設成同一值。
+這個 provisioning 只下載 runtime/model，不會上傳本地影片。
+
 ## 4. 讓 Hermes 找得到 skill
 
-從 repository root 開啟 Hermes，檢查 local skill discovery：
+Hermes 只從受信任 repository 的 '.agents/skills' 或 '.hermes/skills' 載入
+project-local skill。先明確 trust，再檢查 discovery：
 
 ~~~powershell
 Set-Location -LiteralPath $RepoRoot
-hermes skills list --source all
-~~~
-
-輸出應包含本地啟用的 'local-livestream-premiere'。若目前 Hermes build 提供
-skill trust 子命令，而 skill 尚未出現，執行：
-
-~~~powershell
 hermes skills trust $RepoRoot
 hermes skills list --source all
 ~~~
 
-若仍找不到，確認沒有在錯誤的資料夾啟動 Hermes，並確認
-'hermes-skills\media\local-livestream-premiere\SKILL.md' 存在。不要自行建立
-另一份同名 skill，避免載入錯誤版本。
+輸出應包含本地啟用的 'local-livestream-premiere'。Project-local skill 優先於
+'%LOCALAPPDATA%\hermes\skills' 的使用者副本；這可避免讀到舊版同名 skill。若仍
+找不到，確認從 repository root 啟動，且
+'.agents\skills\local-livestream-premiere\SKILL.md' 存在。不要自行建立另一份
+同名 skill。
 
 ## 5. 生成 project-scoped MCP config
 
@@ -192,7 +223,7 @@ hermes skills list --source all
 
 ~~~powershell
 Set-Location -LiteralPath $RepoRoot
-$Bootstrap = Join-Path $RepoRoot 'hermes-skills\media\local-livestream-premiere\scripts\ensure-hermes-config.ps1'
+$Bootstrap = Join-Path $RepoRoot '.agents\skills\local-livestream-premiere\scripts\ensure-hermes-config.ps1'
 powershell -NoProfile -ExecutionPolicy Bypass -File $Bootstrap -RepoRoot $RepoRoot -HermesRoot $HermesRoot -VideoRoot $VideoRoot
 ~~~
 
@@ -216,6 +247,14 @@ bootstrap 會：
 - 若 config 已存在，先建立 timestamped .bak-* backup。
 - 將 <VIDEO_ROOT> 放入 'HIGHLIGHT_ALLOWED_ROOTS'，不放寬到整台機器。
 - 指向本地 cache、Transformers runtime 和 system FFmpeg toolchain。
+- 讓 video_context 與 highlight_local 使用相同的 ASR model。
+
+預設 ASR model 是英文 'Xenova/whisper-base.en'。多語或非英文影片在 preview
+和 apply 都傳入相同的 '-AsrModel'，例如：
+
+~~~powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File $Bootstrap -RepoRoot $RepoRoot -HermesRoot $HermesRoot -VideoRoot $VideoRoot -AsrModel 'Xenova/whisper-base' -Apply
+~~~
 
 生成的 server map 應符合：
 
@@ -228,7 +267,43 @@ bootstrap 會：
 '.codex'、'.cache'、'node_modules'、'tools\bin' 和使用者路徑都是本機生成或安裝
 內容，不應 commit 到 repository。
 
-## 6. 重新啟動 Hermes 並驗證三個 MCP
+## 6. 安裝並啟動 Premiere CEP bridge
+
+Bootstrap preview 會顯示 CEP extension 是 installed 或 missing。只有使用者要求
+或核准 environment setup 後，才用明確 opt-in 安裝：
+
+~~~powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File $Bootstrap -RepoRoot $RepoRoot -HermesRoot $HermesRoot -VideoRoot $VideoRoot -Apply -InstallPremiereCep
+~~~
+
+這個 switch 會使用已安裝 'adobe-premiere-pro-mcp' package 的官方 Windows
+installer，並：
+
+- 替換前把目前使用者的 extension 備份到
+  '<HERMES_ROOT>\backups\premiere-cep'（不放在 Adobe extensions 目錄，避免重複載入）；
+- 安裝 CEP panel、設定 Adobe CSXS PlayerDebugMode、建立 'PREMIERE_TEMP_DIR'；
+- 跳過 VS Code/Copilot 與 Claude Desktop config，避免修改無關 client。
+
+完成後執行 package doctor：
+
+~~~powershell
+$PremiereCli = Join-Path $HermesNodeRoot 'node_modules\adobe-premiere-pro-mcp\dist\cli.js'
+& (Join-Path $HermesNodeRoot 'node.exe') $PremiereCli --doctor
+~~~
+
+接著：
+
+1. 完全關閉並重新開啟 Premiere Pro，載入 project。
+2. 開啟 'Window > Extensions > MCP Bridge (CEP)'。
+3. 將 panel 的 Temp Directory 設成 bootstrap 顯示的 'Premiere temp' 完整路徑。
+4. 依序按 'Save Configuration'、'Start Bridge'、'Test Connection'。
+5. Panel 必須顯示 Started/Connected。
+
+Panel 不出現時，確認
+'%APPDATA%\Adobe\CEP\extensions\MCPBridgeCEP\CSXS\manifest.xml'、doctor 與
+debug mode，然後重啟 Premiere。不要啟用 package 內的 experimental UXP panel。
+
+## 7. 重新啟動 Hermes 並驗證三個 MCP
 
 套用 config 後，關閉舊 session，從 repository root 開啟新的 Hermes session：
 
@@ -244,18 +319,20 @@ hermes mcp test premiere_cep
 
 - 'video_context'：list_videos、ingest_video、get_ingest_status、get_video_timeline、search_videos、get_transcript，以及可用時的 peek_frame。
 - 'highlight_local'：server_info、analyze_video、get_analysis_status、get_frame，以及可用時的 export_premiere_plan。
-- 'premiere_cep'：verify_premiere_connection、import_media、duplicate_sequence、add_to_timeline_batch、add_marker、set_active_sequence、list_sequence_tracks、validate_project_for_export。
+- 'premiere_cep'：get_capabilities、verify_premiere_connection、import_media、duplicate_sequence、add_to_timeline_batch、add_marker、set_active_sequence、list_sequence_tracks、validate_project_for_export。
 
 'hermes mcp test premiere_cep' 能連到 MCP process，不代表 Premiere 已準備好。
-實際剪輯前仍要啟動 Premiere、載入 project、開啟 CEP bridge panel，再以
-'verify_premiere_connection' 確認應用程式連線。
+實際剪輯前先呼叫 'get_capabilities(checkConnection=false)' 檢查本地安裝，再依
+第 6 節啟動 panel，最後以 'verify_premiere_connection' 確認 host 與 project。
+只有最後一步成功才可修改 Premiere；若 activeSequence 是 null，建立新 sequence
+而不是拿不存在的 ID 呼叫 duplicate。
 
 如果 'highlight_local' 的 'server_info' 可用，應確認 local-only、'uxp: false'
 和 'networkListener: false'。連線失敗時修正安裝或 CEP panel，不要切換協定。
 
-## 7. 第一次實際剪輯的安全流程
+## 8. 第一次實際剪輯的安全流程
 
-### 7.1 分析階段：不修改 Premiere
+### 8.1 分析階段：不修改 Premiere
 
 向 Hermes 提供影片絕對本地路徑、目標風格和期望片段長度：
 
@@ -273,7 +350,7 @@ hermes mcp test premiere_cep
 5. 只對 shortlist 取 frame/OCR。
 6. 回傳 candidate ID、起訖時間、duration、score、理由、短 quote/visual cue 和證據限制。
 
-### 7.2 核准閘門
+### 8.2 核准閘門
 
 分析結果出來後必須停止，等待使用者明確核准 candidate ID 或時間範圍：
 
@@ -283,22 +360,23 @@ hermes mcp test premiere_cep
 
 單純說「分析影片」不包含修改 Premiere 的授權。
 
-### 7.3 剪輯階段：使用 CEP、保留原始 sequence
+### 8.3 剪輯階段：使用 CEP、保留原始 sequence
 
 核准後才執行：
 
-1. 'premiere_cep.verify_premiere_connection'。
-2. 'duplicate_sequence' 或建立新 sequence；不要清空、刪除或覆寫原始 sequence。
-3. 'import_media'（若素材尚未在 project）。
-4. 用 'add_to_timeline_batch' 加入核准的 in/out，保留需要的 linked audio。
-5. 用 'add_marker' 標記來源時間或 candidate ID，並 'set_active_sequence'。
-6. 用 'list_sequence_tracks'、'validate_project_for_export' 做 read-only verification。
-7. 只有使用者另外要求時，才 'save_project'、Save As 或 export。
+1. 'premiere_cep.get_capabilities(checkConnection=false)'，確認 CEP 已安裝。
+2. 'premiere_cep.verify_premiere_connection'；失敗立即停止。
+3. 'duplicate_sequence(clearContents=true)' 或建立新 sequence；不要清空、刪除或覆寫原始 sequence。
+4. 'import_media'（若素材尚未在 project）。
+5. 用 'add_to_timeline_batch' 加入核准的 in/out，保留需要的 linked audio。
+6. 用 'add_marker' 標記來源時間或 candidate ID，並 'set_active_sequence'。
+7. 用 'list_sequence_tracks'、'validate_project_for_export' 做 read-only verification。
+8. 只有使用者另外要求時，才 'save_project'、Save As 或 export。
 
 完成回報列出 sequence、clip 數、audio linkage、gap/offline media、duration，以及
 目前仍未儲存或未輸出的項目。
 
-## 8. 常見問題與回復
+## 9. 常見問題與回復
 
 | 現象 | 處理 |
 |---|---|
@@ -308,13 +386,13 @@ hermes mcp test premiere_cep
 | FFmpeg/FFprobe/yt-dlp missing | 檢查 tools\bin，或用 '-FfmpegBin'、'-FfprobeBin' 傳入絕對路徑；VideoRoot 也必須存在。 |
 | ASR 不可用 | 確認 Transformers runtime/model cache；或提供本地 .srt/.vtt sidecar，並在結果中標示 fallback。 |
 | highlight_local 拒絕影片路徑 | 用影片所在的本地父資料夾作為 '-VideoRoot'，不要用整台磁碟或根目錄放寬 allowlist。 |
-| premiere_cep process 已連線但 Premiere verify 失敗 | 啟動 Premiere、載入 project、開啟 CEP bridge panel，再重跑 connection verify。 |
+| premiere_cep process 已連線但 Premiere verify 失敗 | process test 不是 live test；確認 panel Temp Directory 完全一致，依序 Save/Start/Test，再重跑 verify。 |
 | 分析超時 | 重用 indexed video_id，以 ASR-first、短搜尋和 shortlist frame inspection 降低成本。 |
 
 遇到 bootstrap 失敗時，保留它回報的第一個 missing path，先補齊該依賴再重跑
 preview。不要用替代協定繞過安全邊界。
 
-## 9. 更新與最終檢查
+## 10. 更新與最終檢查
 
 repository 更新後：
 
@@ -343,7 +421,7 @@ npm test
 - [ ] local-livestream-premiere 已被 Hermes discovery 啟用。
 - [ ] bootstrap preview 通過，-Apply 已生成 project-scoped TOML。
 - [ ] 三個 hermes mcp test 都通過。
-- [ ] Premiere Pro 與 CEP bridge panel 已準備好。
+- [ ] get_capabilities 確認 CEP 安裝，panel 已 Started/Connected，verify_premiere_connection 成功。
 - [ ] 分析先於剪輯，且取得 candidate approval。
 - [ ] 原始 sequence 保留，新 sequence 完成 read-only verification。
 - [ ] 儲存或 export 只在使用者明確要求後執行。

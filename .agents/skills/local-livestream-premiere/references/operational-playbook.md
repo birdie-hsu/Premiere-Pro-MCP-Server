@@ -1,4 +1,4 @@
-# Operational playbook
+# Solution operational playbook
 
 This reference contains the detailed procedure behind `local-livestream-premiere`. Keep the main skill short; load this file when the workflow is actually requested.
 
@@ -89,7 +89,7 @@ Include the source `video_id`, analysis method, and whether frames/OCR were avai
 
 After presenting candidates, stop and ask for an explicit selection. Examples of sufficient approval:
 
-- “剪 V-02、V-05、V-10。”
+- “剪 highlight-002、highlight-005、highlight-010。”
 - “Use the recommended six clips.”
 - “Put 00:39:34–00:40:20 and 01:52:25–01:53:25 in a new sequence.”
 
@@ -99,10 +99,12 @@ Do not treat a request to “analyze” or “show me candidates” as approval.
 
 Only after approval:
 
-1. Call `verify_premiere_connection`. If it fails, tell the user to open the CEP bridge panel and stop; do not retry indefinitely or switch to UXP.
-2. Use the returned active sequence ID as the duplication source unless the user names another sequence. `duplicate_sequence` with `clearContents=true` creates a new empty sequence while preserving the source.
-3. Call `import_media` with the exact absolute source path. It is safe to reuse an item when the tool reports `alreadyImported=true`.
-4. Compute a timeline cursor starting at 0. Put approved clips in the requested order with `add_to_timeline_batch`, using:
+1. Call `get_capabilities` with `checkConnection=false`. Require `bridge.cep.status="installed"`; otherwise stop and follow the setup reference. If `update.available=true` and the update is not snoozed, ask the user to choose Update now or Later before editing. Do not switch to UXP.
+2. Confirm that Premiere's `MCP Bridge (CEP)` panel uses the exact configured `PREMIERE_TEMP_DIR` and is Started/Connected. `hermes mcp test premiere_cep` proves only that the stdio server starts.
+3. Call `verify_premiere_connection`. If it fails, report the specific bridge/project state and stop; do not retry indefinitely.
+4. Inspect the project/active sequence read-only. A successful connection may still return `activeSequence: null`; that is not a bridge failure. Use a real active/user-selected sequence ID as the duplication source. `duplicate_sequence` with `clearContents=true` creates a new empty sequence while preserving the source settings. If no source sequence exists, prefer `create_sequence_from_clips`; use `create_sequence` only with a real installed `.sqpreset`, because a missing preset can open a native dialog.
+5. Call `import_media` with the exact absolute source path. It is safe to reuse an item when the tool reports `alreadyImported=true`.
+6. Compute a timeline cursor starting at 0. Put approved clips in the requested order with `add_to_timeline_batch`, using:
 
    - `sequenceId`: the new sequence ID
    - `projectItemId`: the imported media ID
@@ -113,8 +115,10 @@ Only after approval:
 
    Advance the cursor using the returned actual `outPoint`, not only the requested duration. This avoids frame-rounding gaps.
 
-5. Add a marker at each returned actual start time. Include the candidate ID, source range, short quote/reason, and any content warning.
-6. Set the new sequence active so the user can see it.
+7. Add a marker at each returned actual start time. Include the candidate ID, source range, short quote/reason, and any content warning.
+8. Set the new sequence active so the user can see it.
+
+After every mutation, run the narrowest read-only inspection that can prove the intended change. Any `success:false` response is a stop condition; inspect the current state before deciding whether one corrected retry is safe.
 
 If `list_sequences` or `get_active_sequence` returns `ReferenceError: __ticksToSeconds is not a function`, do not loop on the broken call. Continue with the active sequence ID from `verify_premiere_connection` and use `list_sequence_tracks` for verification.
 

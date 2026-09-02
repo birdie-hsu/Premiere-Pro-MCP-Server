@@ -11,6 +11,9 @@
     "start": "node src/index.js",
     "test": "node --test"
   },
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",
     "zod": "3.25.76"

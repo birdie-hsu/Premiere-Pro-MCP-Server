@@ -1,4 +1,4 @@
-# Local scoring profile
+# Local highlight scoring profile
 
 The local fallback uses transparent, local-only signals. Scores prioritize candidates; they are not semantic truth.
 
@@ -31,4 +31,3 @@ The analysis JSON reports the enabled signal names and the path to the local `si
 Generate candidate starts from audio peaks, transcript cues, and scene boundaries, then rank fixed windows with transparent evidence and reject excessive overlap. When a natural-length selector is available, merge nearby evidence regions, constrain minimum/maximum duration, and rank by score density before applying the non-overlap/coverage rule.
 
 Always present source timestamps, duration, score, reason, quote or visual cue, and evidence limitations. Do not infer a visual action from transcript/audio alone. Review candidates before any Premiere mutation.
-
