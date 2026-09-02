@@ -1,41 +1,90 @@
 # Local livestream highlight solution
 
-This repository is a three-MCP workflow, not a single Premiere server. Use:
+This repository is a three-MCP workflow, not a single Premiere server. The
+canonical operator procedure is
+.agents/skills/local-livestream-premiere/SKILL.md. It is written for a small
+Hermes local model. Follow it literally.
 
-- `video_context` for local ingest, ASR/transcript, timeline, search, keyframes, and OCR;
-- `highlight_local` (`src/index.js`) for transparent transcript/audio/scene/motion scoring and JSON/FCP7 handoff;
-- `premiere_cep` for live Adobe Premiere Pro work through the CEP bridge, only after approval.
+## Three servers
 
-The canonical project skill is `.agents/skills/local-livestream-premiere/SKILL.md`. A fresh Hermes installation must trust this repository with `hermes skills trust <REPO_ROOT>` so the repo-local skill wins over any stale user-level copy.
+- video_context: optional local transcript search and timeline evidence.
+- highlight_local: default local scoring and JSON/FCP7 handoff. It never edits
+  Premiere.
+- premiere_cep: live Adobe Premiere Pro work through the CEP bridge.
+
+The three registrations are all required for a complete installation, but a
+normal analysis uses highlight_local first and a normal edit uses premiere_cep
+only after approval.
 
 ## Required reading
 
-- For a new machine, missing MCP, config, or bridge: read `.agents/skills/local-livestream-premiere/references/mcp-setup-windows.md` before changing the environment.
-- For an analysis/editing request: read `.agents/skills/local-livestream-premiere/references/operational-playbook.md`.
-- For scoring behavior or changes: read `.agents/skills/local-livestream-premiere/references/scoring-profile.md`.
+- Always read .agents/skills/local-livestream-premiere/SKILL.md first.
+- For a new machine, missing MCP, config, or bridge, read
+  .agents/skills/local-livestream-premiere/references/mcp-setup-windows.md
+  before changing the environment.
+- For analysis or editing, read
+  .agents/skills/local-livestream-premiere/references/operational-playbook.md
+  after the main skill.
+- For scoring changes or signal questions, read
+  .agents/skills/local-livestream-premiere/references/scoring-profile.md.
+
+## 9B execution contract
+
+1. Keep VIDEO_PATH, STYLE, CLIP_SECONDS, MAX_CANDIDATES, KEYWORDS, and
+   ANALYSIS_ID. Defaults are general, 45, 5, and [].
+2. Ask for the absolute local VIDEO_PATH if it is missing. Never scan the
+   computer. The path must be inside HIGHLIGHT_ALLOWED_ROOTS.
+3. Analyse with highlight_local.server_info, analyze_video, then poll
+   get_analysis_status. Poll only while queued/running; stop at 30 polls.
+4. Return candidate IDs, source start/end, duration, score, reasons, quote, and
+   evidence. Scores are ranking aids.
+5. Stop and ask for explicit candidate IDs. Analysis is not editing approval.
+6. After approval, call Premiere tools in this exact order:
+   get_capabilities(checkConnection=false) →
+   verify_premiere_connection →
+   choose a source sequence →
+   duplicate_sequence(clearContents=true) →
+   import_media →
+   add_to_timeline_batch(linkAudio=true) →
+   set_active_sequence →
+   list_sequence_tracks →
+   validate_project_for_export.
+7. Require bridge.cep.status=installed, then
+   verify_premiere_connection success=true and status=connected.
+8. If no active sequence exists, use list_sequences only:
+   count=1 uses sequences[0].id; count=0 stops; count>1 stops and asks the
+   user to open the desired source sequence. Do not guess.
+9. For this simple route, never use create_sequence, create_sequence_from_clips,
+   a guessed .sqpreset, add_marker, UXP, raw ExtendScript, or a network
+   listener.
+10. Any success=false, isError=true, partial result, or failed verification is
+    a stop condition. Do not retry blindly.
+11. Saving the .prproj and rendering a video require separate explicit approval.
 
 ## Environment contract
 
-The project-scoped MCP config is `.codex/config.toml` in TOML format. Do not create a project YAML config or commit `.codex`, `.cache`, media, models, tools, projects, exports, or user-specific paths.
+The only project config is .codex/config.toml in TOML format. Do not create a
+project YAML config or commit .codex, .cache, media, models, tools, projects,
+exports, or user-specific paths.
 
-Use the skill's `ensure-hermes-config.ps1` in preview mode first. Use `-Apply` only for requested/approved setup. Installing the CEP extension is a separate explicit action through `-Apply -InstallPremiereCep`; it replaces the current user's `MCPBridgeCEP` extension after making a backup.
+Use the skill script
+.agents/skills/local-livestream-premiere/scripts/ensure-hermes-config.ps1.
+Run preview first. Use -Apply only when setup was requested or approved.
+Install the CEP extension only with the explicit
+-Apply -InstallPremiereCep option; it backs up the current MCPBridgeCEP before
+replacement.
 
-Premiere readiness has distinct levels:
+Premiere readiness has four separate checks:
 
-1. `hermes mcp test premiere_cep` proves only that the stdio MCP process starts.
-2. `get_capabilities(checkConnection=false)` checks the local package/bridge installation without editing.
-3. In Premiere, open `Window > Extensions > MCP Bridge (CEP)`, set the exact `PREMIERE_TEMP_DIR`, then click `Save Configuration`, `Start Bridge`, and `Test Connection`.
-4. `verify_premiere_connection` must succeed before any Premiere mutation.
+1. Bootstrap preview: local paths, packages, tools, and runtime exist.
+2. hermes mcp test premiere_cep: stdio MCP starts. This does not prove Premiere
+   is connected.
+3. premiere_cep.get_capabilities(checkConnection=false):
+   bridge.cep.status must be installed.
+4. In Premiere open Window > Extensions > MCP Bridge (CEP), set the exact
+   generated PREMIERE_TEMP_DIR, click Save Configuration, Start Bridge, and
+   Test Connection, then call verify_premiere_connection.
 
-Do not claim Premiere is ready from the MCP process test alone.
-
-## Runtime state machine
-
-1. **DISCOVER** — obtain the absolute local video path plus highlight style/length. Do not scan the machine; the path must be inside the configured allowlist.
-2. **ANALYZE** — prefer `video_context` ASR-first analysis, and use `highlight_local` for transparent scoring/fallback. Return candidate ID, source start/end, duration, 0–100 score, reason, quote/visual cue, and evidence limits. Do not modify Premiere.
-3. **REVIEW** — stop until the user explicitly approves candidate IDs or time ranges. Analysis requests are not editing permission.
-4. **ASSEMBLE** — check capabilities and live CEP connection; inspect the project read-only; preserve the original sequence. A connected response may have `activeSequence: null`. Duplicate only a real sequence ID; otherwise use `create_sequence_from_clips` or a real `.sqpreset`. Import media and place only approved source ranges with `add_to_timeline_batch(linkAudio=true)`.
-5. **VERIFY** — after every mutation, use the narrowest read-only check. Finish with `list_sequence_tracks` and `validate_project_for_export(requireNonEmptyTimeline=true, checkGaps=true)`. Treat `success:false` as a stop condition, not a retry loop.
-6. **PERSIST/EXPORT** — editing approval does not authorize save or export. Ask again before `save_project`, overwriting a project/export, or rendering.
-
-Keep all media and analysis artifacts local. Never substitute UXP, direct raw ExtendScript, a cloud video service, or a network listener for the CEP workflow. Prefer non-destructive edits and report clearly when a sequence is created but remains unsaved or unexported.
+Do not claim Premiere is ready from the process test alone. Keep media and
+analysis artifacts local. Preserve the original sequence and report clearly
+when a new sequence is not saved or exported.

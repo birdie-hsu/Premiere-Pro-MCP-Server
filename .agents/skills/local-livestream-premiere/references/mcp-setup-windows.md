@@ -10,9 +10,31 @@ livestream，並在使用者明確核准後把片段組成 Premiere sequence。
 | 'highlight_local' | 分析/交接 | scene、motion、audio、transcript 評分，以及 JSON/FCP7 handoff |
 | 'premiere_cep' | 剪輯 | 透過 CEP bridge 連接 Premiere，建立非破壞性 sequence |
 
-三個 server 不一定同時執行。正常順序是先用 'video_context' 分析，再由
-'highlight_local' 補充評分或交接；只有使用者明確核准候選片段後，才調用
-'premiere_cep' 修改 Premiere。
+三個 server 不一定同時執行。9B 的最短順序是先用 'highlight_local' 取得有分數的
+候選，再等待使用者明確核准；需要主題搜尋或額外 transcript 證據時才使用
+'video_context'；最後才調用 'premiere_cep' 修改 Premiere。
+
+## 9B setup card: do these steps in order
+
+1. Clone the repository, run 'npm ci' and 'npm test'.
+2. Set real absolute values for '<REPO_ROOT>' and '<VIDEO_ROOT>'. Do not use a
+   placeholder and do not scan the computer.
+3. Make sure the three Hermes-side packages and the three local media tools
+   exist. If a package or tool is missing, follow sections 2–3 before running
+   bootstrap; do not guess a download path.
+4. Run 'hermes skills trust <REPO_ROOT>'.
+5. Run bootstrap once without '-Apply'. Fix every reported missing path.
+6. Run bootstrap again with '-Apply'. This writes the three server blocks to
+   '<REPO_ROOT>\.codex\config.toml'.
+7. If CEP is missing and setup is authorized, run '-Apply -InstallPremiereCep'.
+8. Restart Premiere and use the CEP panel buttons in this order:
+   'Save Configuration', 'Start Bridge', 'Test Connection'.
+9. Start a new Hermes session and run the three 'hermes mcp test' commands.
+10. For a real edit, require 'get_capabilities' and then
+    'verify_premiere_connection' before any Premiere mutation.
+
+If a step fails, stop at that step. Show the first error and fix it before
+continuing. The detailed commands below are in the same order.
 
 ## 完成定義
 
@@ -319,13 +341,14 @@ hermes mcp test premiere_cep
 
 - 'video_context'：list_videos、ingest_video、get_ingest_status、get_video_timeline、search_videos、get_transcript，以及可用時的 peek_frame。
 - 'highlight_local'：server_info、analyze_video、get_analysis_status、get_frame，以及可用時的 export_premiere_plan。
-- 'premiere_cep'：get_capabilities、verify_premiere_connection、import_media、duplicate_sequence、add_to_timeline_batch、add_marker、set_active_sequence、list_sequence_tracks、validate_project_for_export。
+- 'premiere_cep'：get_capabilities、verify_premiere_connection、list_sequences、import_media、duplicate_sequence、add_to_timeline_batch、set_active_sequence、list_sequence_tracks、validate_project_for_export。
 
 'hermes mcp test premiere_cep' 能連到 MCP process，不代表 Premiere 已準備好。
 實際剪輯前先呼叫 'get_capabilities(checkConnection=false)' 檢查本地安裝，再依
 第 6 節啟動 panel，最後以 'verify_premiere_connection' 確認 host 與 project。
-只有最後一步成功才可修改 Premiere；若 activeSequence 是 null，建立新 sequence
-而不是拿不存在的 ID 呼叫 duplicate。
+只有最後一步成功才可修改 Premiere。9B 模式要求已有一個 source sequence；若
+'activeSequence' 是 null，只有在 'list_sequences' 回傳唯一 sequence 時才使用它，
+回傳 0 或多個 sequence 就停止並請使用者建立/開啟正確的 sequence。
 
 如果 'highlight_local' 的 'server_info' 可用，應確認 local-only、'uxp: false'
 和 'networkListener: false'。連線失敗時修正安裝或 CEP panel，不要切換協定。
@@ -343,12 +366,13 @@ hermes mcp test premiere_cep
 
 正常順序：
 
-1. 'video_context' ingest 影片，或重用相同本地影片的 video_id。
-2. 長影片優先採 ASR-first：visual=false、embed=false、whisper_fallback=true。
-3. 用 transcript、timeline 和短搜尋找候選。
-4. 'highlight_local' 必要時補 scene boundary、低權重 motion、相對 audio burst、transcript score，或輸出 JSON/FCP7 handoff。
-5. 只對 shortlist 取 frame/OCR。
-6. 回傳 candidate ID、起訖時間、duration、score、理由、短 quote/visual cue 和證據限制。
+1. 用 'highlight_local.server_info' 確認 localOnly=true、uxp=false、
+   networkListener=false。
+2. 用 'highlight_local.analyze_video' 啟動評分，固定預設為 45 秒、最多 5 個
+   candidates；保存回傳的 'analysisId'。
+3. 用 'highlight_local.get_analysis_status' 輪詢到 completed，最多 30 次。
+4. 回傳 candidate ID、起訖時間、duration、score、理由、短 quote 和 evidence。
+5. 需要主題搜尋時才使用 'video_context'，而且 search hit 不可自行填 0–100 分。
 
 ### 8.2 核准閘門
 
@@ -364,14 +388,18 @@ hermes mcp test premiere_cep
 
 核准後才執行：
 
-1. 'premiere_cep.get_capabilities(checkConnection=false)'，確認 CEP 已安裝。
+1. 'premiere_cep.get_capabilities(checkConnection=false)'，確認
+   'bridge.cep.status=installed'。
 2. 'premiere_cep.verify_premiere_connection'；失敗立即停止。
-3. 'duplicate_sequence(clearContents=true)' 或建立新 sequence；不要清空、刪除或覆寫原始 sequence。
-4. 'import_media'（若素材尚未在 project）。
-5. 用 'add_to_timeline_batch' 加入核准的 in/out，保留需要的 linked audio。
-6. 用 'add_marker' 標記來源時間或 candidate ID，並 'set_active_sequence'。
-7. 用 'list_sequence_tracks'、'validate_project_for_export' 做 read-only verification。
-8. 只有使用者另外要求時，才 'save_project'、Save As 或 export。
+3. 找到 active source sequence；沒有 active sequence 時只接受唯一 sequence，
+   不猜 sequence。
+4. 'duplicate_sequence(clearContents=true)'；不要清空、刪除或覆寫原始 sequence。
+5. 'import_media'，保存真實回傳的 media 'id'。
+6. 用 'add_to_timeline_batch' 加入核准的 in/out，使用 'trackIndex=0'、
+   'linkAudio=true'。
+7. 用 'set_active_sequence'、'list_sequence_tracks'、
+   'validate_project_for_export' 做 read-only verification。
+8. 9B 最小模式不加 marker；只有使用者另外要求時，才 save、Save As 或 export。
 
 完成回報列出 sequence、clip 數、audio linkage、gap/offline media、duration，以及
 目前仍未儲存或未輸出的項目。

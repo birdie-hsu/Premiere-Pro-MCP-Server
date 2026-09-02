@@ -1,141 +1,249 @@
-# Solution operational playbook
+# Operational playbook: exact 9B route
 
-This reference contains the detailed procedure behind `local-livestream-premiere`. Keep the main skill short; load this file when the workflow is actually requested.
+Read this file only after loading the canonical skill. It is a detailed reminder
+of the same route; it is not a second route. The canonical skill wins if text
+appears different.
 
-## 1. State machine
+## 1. Fixed inputs
 
-Use these states and do not skip the review gate:
+Keep these values in the conversation:
 
-| State | Allowed actions | Required output |
-|---|---|---|
-| DISCOVER | Resolve a local path and inspect available MCP tools | Source path, requested style/length, available servers |
-| ANALYZE | Ingest, poll, search transcript/timeline, inspect a few frames | Ranked candidate table; no Premiere mutation |
-| REVIEW | Ask the user to approve IDs/ranges and any clean-language or aspect-ratio preference | Explicit approval |
-| ASSEMBLE | Verify CEP, duplicate/new sequence, import media, place approved ranges, add markers | New sequence ID and placement results |
-| VERIFY | Inspect tracks and run export-readiness audit | Counts, duration, gaps, offline-media status |
-| PERSIST/EXPORT | Save or render only after the user asks and supplies/approves the path | Saved/exported path or a clear unsaved/unexported notice |
+| Variable | Required value |
+|---|---|
+| VIDEO_PATH | Absolute local video path supplied by the user |
+| STYLE | User value, or general |
+| CLIP_SECONDS | User value from 10 to 600, or 45 |
+| MAX_CANDIDATES | 5 |
+| KEYWORDS | User values, or [] |
+| ANALYSIS_ID | Returned by analyze_video |
+| APPROVED_IDS | IDs explicitly approved by the user |
 
-## 2. Input handling
+If VIDEO_PATH is missing, ask for it. Never search the computer. If the path is
+outside HIGHLIGHT_ALLOWED_ROOTS, stop and report that setup must add its parent
+folder.
 
-Ask for an absolute local path if it is missing. Never search the whole machine or silently copy a large video. If the path is outside the server allowlist, explain that the user must add its parent directory to `HIGHLIGHT_ALLOWED_ROOTS` (or use a configured `video_context` path) before analysis.
+## 2. Default analysis
 
-Infer a useful default only when it is safe:
+Use highlight_local first. It is the only server in the default analysis path
+that directly returns a 0–100 score.
 
-- “Find product information” → product-introduction, specification, comparison, demonstration, and product-manager language.
-- “Find viral cuts” → reactions, laughter, cheering, surprises, reversals, clutch outcomes, failures with a clear payoff, and quotable lines.
-- Missing target length → 15–60 seconds per short-form candidate; allow a longer window when the setup-to-payoff arc needs it, but explain why.
-- Missing output shape → make one new stringout/highlight sequence with clips in source order and markers at each clip start. Ask before exporting separate files.
+Call the tools in this order:
 
-## 3. Low-token ASR-first analysis
+1. mcp_highlight_local_server_info with {}.
+2. Continue only if localOnly=true, uxp=false, and networkListener=false.
+3. mcp_highlight_local_analyze_video with:
 
-### Preferred route: `video_context`
+~~~json
+{
+  "video_path": "VIDEO_PATH",
+  "clip_length_seconds": 45,
+  "max_candidates": 5,
+  "style": "STYLE",
+  "keywords": []
+}
+~~~
 
-Use the Hermes-prefixed versions of these server tools (the prefix is normally automatic):
+4. Save the returned analysisId. Call
+   mcp_highlight_local_get_analysis_status with:
 
-1. `list_videos` to see whether the local file is already indexed. Reuse the matching `video_id`.
-2. If needed, call `ingest_video` with the absolute path. For a long local recording use:
+~~~json
+{
+  "analysis_id": "ANALYSIS_ID",
+  "include_transcript": false
+}
+~~~
 
-   - `visual: false`
-   - `embed: false`
-   - `whisper_fallback: true`
+5. Poll only while status is queued or running. Stop at 30 polls. Continue
+   only for status completed. Stop for status error.
+6. Read result.candidates. Copy id, startSeconds, endSeconds,
+   durationSeconds, score, reasons, quote, and evidence.
 
-   Poll `get_ingest_status` until `stage=done` or an error is returned. Do not repeatedly request a full result while the job is running.
+The score is a local ranking aid. It is not a claim that a human would like the
+clip. Evidence can contain transcriptSignal, audioEnergy, audioBurst,
+sceneBoundary, and motionEnergy. Motion is weak evidence. A scene boundary or
+audio peak alone is not a reason to select a clip. Do not claim an object or
+action unless the evidence says it.
 
-3. Call `get_video_timeline` once for duration, transcript source, chapters/outline, and keyframe availability.
-4. Search with short queries and `limit` around 5–8. Run terms separately when needed, for example:
+### Optional transcript search
 
-   - Viral: `cheering`, `laughing`, `scream`, `wow`, `no way`, `clutch`, `headshot`, `victory`, `missed`, `dramatic music`, `last chance`.
-   - Product: the brand/product name, `product manager`, `features`, `specs`, `OLED`, `battery`, `DPI`, `upgrade`.
-   - Event: `show begins`, `challenge`, `versus`, `round`, `dragon`, `final`, `winner`.
+Use video_context only if the user specifically asks for topic/transcript
+search or the local scorer cannot run. This is evidence gathering, not scoring.
 
-   Merge hits that are within roughly 10–30 seconds and follow each hit with a narrow `get_transcript` slice. Compound natural-language queries are less reliable when `semantic_search.available` is false, so use several cheap searches instead of one large query.
+Call in this order:
 
-5. For a visual check, call `peek_frame` only on the shortlist when indexed keyframes exist. If the timeline says there are no keyframes, use `highlight_local.get_frame` at one or two timestamps per candidate, or mark visual evidence as unavailable. Do not re-index a multi-gigabyte video visually just to improve a preliminary ranking without telling the user about the extra cost.
+1. mcp_video_context_ingest_video with
+   url_or_path=VIDEO_PATH, visual=false, embed=false, whisper_fallback=true.
+2. Poll mcp_video_context_get_ingest_status until stage=done.
+3. mcp_video_context_get_video_timeline once.
+4. mcp_video_context_search_videos with one short query and limit=5.
+5. mcp_video_context_get_transcript around a promising timestamp.
 
-### Fallback route: `highlight_local`
+Do not assign a score to a search hit. If a scored table is needed, return to
+the default highlight_local route.
 
-Use this local MCP when `video_context` is unavailable, when a transparent audio/scene heuristic is useful, or when the user requests a reusable plan:
+If the user asks for a handoff file after approving IDs, call
+mcp_highlight_local_export_premiere_plan once with the last ANALYSIS_ID,
+approved candidate_ids, a local output_dir, include_xml=true, and
+overwrite=false. Require success=true. The generated JSON/FCP7 files are not a
+Premiere edit.
 
-1. `server_info` to verify `localOnly=true`, `uxp=false`, and `networkListener=false`.
-2. `analyze_video` with the local path, target `clip_length_seconds`, `max_candidates`, `style`, and optional `keywords`.
-3. Poll `get_analysis_status` until `status=completed`. Keep `include_transcript=false` for compact polling; request full transcript only for a selected range.
-4. Treat the returned score as a transparent heuristic, not semantic truth. Preserve its `reasons` and `evidence` in the candidate report.
-5. After approval, `export_premiere_plan` may write a non-destructive JSON/FCP7 XML handoff. It refuses existing files unless `overwrite=true`; never turn this into a silent overwrite.
+## 3. Review gate
 
-## 4. Candidate scoring and reporting
+Return one row per candidate:
 
-Score candidates on a 0–100 scale and state that the score is a prioritization aid. A useful rubric is:
-
-| Signal | Weight | What to reward |
-|---|---:|---|
-| Payoff / narrative arc | 30% | A recognizable hook, tension, and outcome inside the window |
-| Energy / reaction | 25% | Cheering, laughter, screams, fast exchange, music hit, or audio peak |
-| Standalone clarity | 20% | A viewer can understand the moment without the entire livestream |
-| Quotable hook | 15% | A short memorable line, surprise, joke, or challenge |
-| Visual/scene evidence | 10% | Scene changes, visible action, on-screen result, or verified frame cue |
-
-Subtract or flag candidates with long setup and no payoff, product-ad-only content when the request is for activities, ambiguous ASR, long silence, or an unclear ending. Do not invent visual facts from transcript alone.
-
-The local fallback additionally records one-second evidence for transcript signal, relative audio burst, scene boundary, and low-weight frame-difference motion. Use `audioBurst` for a sudden rise over the video's local level, `sceneBoundary` as an edge/candidate-generation cue, and `motionEnergy` only as supporting visual evidence. A scene cut or motion event alone is not sufficient reason to select a clip. Treat audio peak and audio burst as one audio family when checking multi-signal agreement.
-
-Return this minimum table:
-
-| ID | Source start–end | Duration | Score | Why it may travel | Quote / visual cue | Confidence |
+| ID | Source start–end | Duration | Score | Reason | Quote / evidence | Limit |
 |---|---|---:|---:|---|---|---|
 
-Include the source `video_id`, analysis method, and whether frames/OCR were available. If ASR is noisy, preserve the original wording and label it as an ASR approximation rather than silently correcting names.
+Then write:
 
-## 5. Approval gate
+~~~text
+請只回覆要剪的候選 ID，例如：使用 highlight-001、highlight-003。
+我在收到 ID 前不會修改 Premiere。
+~~~
 
-After presenting candidates, stop and ask for an explicit selection. Examples of sufficient approval:
+Stop. Do not call any premiere_cep tool. An instruction to “find” or
+“analyse” is not approval.
 
-- “剪 highlight-002、highlight-005、highlight-010。”
-- “Use the recommended six clips.”
-- “Put 00:39:34–00:40:20 and 01:52:25–01:53:25 in a new sequence.”
+## 4. Premiere preconditions
 
-Do not treat a request to “analyze” or “show me candidates” as approval. If the user already asked to edit but did not select a range, present the shortlist and ask which IDs to use; do not guess a materially different set.
+Only enter this section when APPROVED_IDS are present in the last candidate
+table. Use the approval order.
 
-## 6. Premiere CEP assembly
+Premiere must have the desired source sequence open. If the bridge reports no
+active sequence, use list_sequences:
 
-Only after approval:
+- count=1: use sequences[0].id.
+- count=0: stop and ask the user to create/open one sequence.
+- count>1: stop and ask the user to open the desired sequence, then run EDIT
+  again.
+- tool error: stop; do not loop.
 
-1. Call `get_capabilities` with `checkConnection=false`. Require `bridge.cep.status="installed"`; otherwise stop and follow the setup reference. If `update.available=true` and the update is not snoozed, ask the user to choose Update now or Later before editing. Do not switch to UXP.
-2. Confirm that Premiere's `MCP Bridge (CEP)` panel uses the exact configured `PREMIERE_TEMP_DIR` and is Started/Connected. `hermes mcp test premiere_cep` proves only that the stdio server starts.
-3. Call `verify_premiere_connection`. If it fails, report the specific bridge/project state and stop; do not retry indefinitely.
-4. Inspect the project/active sequence read-only. A successful connection may still return `activeSequence: null`; that is not a bridge failure. Use a real active/user-selected sequence ID as the duplication source. `duplicate_sequence` with `clearContents=true` creates a new empty sequence while preserving the source settings. If no source sequence exists, prefer `create_sequence_from_clips`; use `create_sequence` only with a real installed `.sqpreset`, because a missing preset can open a native dialog.
-5. Call `import_media` with the exact absolute source path. It is safe to reuse an item when the tool reports `alreadyImported=true`.
-6. Compute a timeline cursor starting at 0. Put approved clips in the requested order with `add_to_timeline_batch`, using:
+For the minimal route, do not use create_sequence, create_sequence_from_clips,
+or a guessed .sqpreset. A real source sequence is required so its frame rate,
+resolution, and track layout can be copied safely.
 
-   - `sequenceId`: the new sequence ID
-   - `projectItemId`: the imported media ID
-   - `time`: the cursor in seconds
-   - `trackIndex: 0`
-   - `sourceInPoint` and `sourceOutPoint`: the approved source seconds
-   - `linkAudio: true`
+## 5. Premiere edit calls
 
-   Advance the cursor using the returned actual `outPoint`, not only the requested duration. This avoids frame-rounding gaps.
+Call only these tools in this order:
 
-7. Add a marker at each returned actual start time. Include the candidate ID, source range, short quote/reason, and any content warning.
-8. Set the new sequence active so the user can see it.
+### 5.1 Installed CEP
 
-After every mutation, run the narrowest read-only inspection that can prove the intended change. Any `success:false` response is a stop condition; inspect the current state before deciding whether one corrected retry is safe.
+Call mcp_premiere_cep_get_capabilities with:
 
-If `list_sequences` or `get_active_sequence` returns `ReferenceError: __ticksToSeconds is not a function`, do not loop on the broken call. Continue with the active sequence ID from `verify_premiere_connection` and use `list_sequence_tracks` for verification.
+~~~json
+{"checkConnection":false}
+~~~
 
-## 7. Verification
+Require success=true and bridge.cep.status=installed. If
+update.available=true and the update is not snoozed, ask the user
+Update now or Later and stop.
 
-Call `list_sequence_tracks` on the new sequence and confirm:
+### 5.2 Live connection
 
-- expected video clip count and audio clip count;
-- video/audio start and end points match the assembled cursor;
-- `linkAudio` was preserved;
-- the source media path is correct.
+Call mcp_premiere_cep_verify_premiere_connection with {}.
 
-Then call `validate_project_for_export` with `requireNonEmptyTimeline=true` and `checkGaps=true`. A successful result should report no errors, `offlineMediaCount=0`, and `gapCount=0`. Missing `outputPath` or preset warnings are expected when the user did not ask for export; they do not mean the edit failed.
+Require success=true and status=connected. A connected response with
+activeSequence=null is allowed, but it requires the sequence selection rule in
+section 4. If this call fails, ask the user to start the CEP panel and stop.
 
-## 8. Save and export policy
+### 5.3 Duplicate the source
 
-- `save_project` overwrites the currently open `.prproj`; ask immediately before using it, even if the edit itself was approved.
-- If the user supplies a new project path, use the CEP Save As operation if available and refuse an existing target unless the user explicitly authorizes replacement.
-- For an MP4, ask for an output path and preset (or confirm an existing local `.epr` preset), run `validate_project_for_export` with those paths, then use the CEP export/render tool. Do not use FFmpeg to bypass Premiere when the user asked for Premiere editing.
-- Report “sequence created but not saved/exported” when those operations were not requested or were rejected.
+Call mcp_premiere_cep_duplicate_sequence with:
+
+~~~json
+{
+  "sequenceId": "SOURCE_SEQUENCE_ID",
+  "newName": "AI Highlights",
+  "clearContents": true
+}
+~~~
+
+Require success=true and newSequenceId. Set TARGET_SEQUENCE_ID to
+newSequenceId. Never use SOURCE_SEQUENCE_ID as the timeline destination.
+
+### 5.4 Import media
+
+Call mcp_premiere_cep_import_media with:
+
+~~~json
+{"filePath":"VIDEO_PATH"}
+~~~
+
+Require success=true and id. Set MEDIA_ID to id. alreadyImported=true is
+successful and still supplies the correct id.
+
+### 5.5 Place clips
+
+Make one object per APPROVED_ID. Use the candidate source times. Start the
+timeline cursor at zero and add each candidate durationSeconds to get the next
+time. Then call mcp_premiere_cep_add_to_timeline_batch once:
+
+~~~json
+{
+  "sequenceId": "TARGET_SEQUENCE_ID",
+  "clips": [
+    {
+      "projectItemId": "MEDIA_ID",
+      "trackIndex": 0,
+      "time": 0,
+      "linkAudio": true,
+      "sourceInPoint": 12.5,
+      "sourceOutPoint": 57.5
+    }
+  ]
+}
+~~~
+
+Require success=true, status=success, failed=0, and placed=total.
+A partial result is not completion. Report results and stop; do not retry.
+
+### 5.6 Activate and verify
+
+Call these three tools:
+
+1. mcp_premiere_cep_set_active_sequence with
+   {"sequenceId":"TARGET_SEQUENCE_ID"}; require success=true.
+2. mcp_premiere_cep_list_sequence_tracks with
+   {"sequenceId":"TARGET_SEQUENCE_ID"}.
+3. mcp_premiere_cep_validate_project_for_export with:
+
+~~~json
+{
+  "sequenceId": "TARGET_SEQUENCE_ID",
+  "requireNonEmptyTimeline": true,
+  "checkGaps": true
+}
+~~~
+
+Require success=true, readyForExport=true, summary.offlineMediaCount=0,
+and summary.gapCount=0. Report any failed requirement.
+
+Markers are not part of the minimal route. Call add_marker only when the user
+explicitly asks for markers.
+
+## 6. Save/export is a separate request
+
+The edit approval does not approve saving or rendering.
+
+- Do not call save_project after E7 unless the user separately says to save.
+- Ask for an exact output path before rendering.
+- Do not overwrite a project, plan, or video output without explicit approval.
+- An unconfirmed save/render is not success.
+- If no save/render was requested, report: sequence created, project not saved,
+  video not exported.
+
+## 7. One-shot failure handling
+
+| Failure | Action |
+|---|---|
+| Missing server/tool | Stop and use the setup reference |
+| Invalid or disallowed path | Stop and ask for an allowed local path |
+| Analysis status error | Show error; do not poll forever |
+| CEP not installed | Stop; run setup only with authorization |
+| Bridge not connected | Stop; user starts the CEP panel |
+| No usable source sequence | Stop; user creates/opens one |
+| Any success=false or isError=true | Show result; no blind retry |
+| Verification has errors/gaps/offline media | Report unfinished; do not save/export |
+
+The local artifacts remain on the machine. Never replace the CEP path with UXP,
+raw ExtendScript, a cloud service, or a network listener.

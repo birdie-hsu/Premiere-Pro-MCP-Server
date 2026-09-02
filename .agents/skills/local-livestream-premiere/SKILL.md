@@ -1,114 +1,393 @@
 ---
 name: local-livestream-premiere
-description: Set up and operate three local MCP servers to analyze livestreams with ASR-first evidence, review highlights, and assemble non-destructive Adobe Premiere Pro sequences through a verified CEP bridge; never use UXP or cloud video services.
+description: Run a local livestream highlight workflow with three local MCP servers, then assemble user-approved clips in Adobe Premiere Pro through the CEP bridge.
 metadata:
   hermes:
     category: media
-    tags: [video, livestream, ASR, highlight, viral-cut, premiere-pro, MCP]
+    tags: [video, livestream, highlight, premiere-pro, MCP]
 ---
 
-# Local Livestream → Highlight → Premiere Pro
+# Local video highlights in Premiere Pro
 
-Use this skill when the user wants a local livestream searched for product information, viral moments, gaming highlights, reactions, or other short clips, and wants the result assembled in Adobe Premiere Pro.
+This file is an operator procedure for a small local model. Follow the numbered
+steps exactly. Use one tool call at a time. Do not invent a tool name, an input
+field, an ID, or a file path.
 
-## Hard boundaries
+## Rules that never change
 
-- Work only on an absolute local video path supplied by the user or already in the configured allowlist.
-- Use local `video_context` for transcript/timeline/search work and local `premiere_cep` for Premiere operations. Use `highlight_local` as the local heuristic fallback or for JSON/FCP7 handoff files.
-- Never use UXP, raw ExtendScript, a cloud video service, or a network listener as a fallback.
-- Analysis and editing are separate phases. During analysis, do not change Premiere. Present timestamped candidates first and wait for the user to approve candidate IDs or ranges before creating/editing a sequence.
-- Preserve the source sequence. After approval, duplicate an existing sequence or create a new one; do not clear, delete, or overwrite the original sequence.
-- Saving the current `.prproj` overwrites the existing project file. Ask for explicit approval immediately before `save_project`; prefer Save As when the user gives a new path.
-- Do not overwrite an existing export or plan file unless the user explicitly requests it.
+1. Use only an absolute local video path supplied by the user. Never scan the
+   computer for videos.
+2. The three servers have different jobs:
+   - video_context: optional transcript search and timeline evidence.
+   - highlight_local: default local scoring. It scores transcript, audio, scene
+     changes, and low-weight motion. It does not edit Premiere.
+   - premiere_cep: Premiere Pro editing through the CEP bridge.
+3. Do not call premiere_cep while analysing or showing candidates.
+4. Do not edit until the user explicitly names candidate IDs, for example
+   使用 highlight-001 和 highlight-003 剪輯.
+5. Do not save a project or render a video unless the user gives a separate
+   explicit save/export instruction.
+6. Never use UXP, raw ExtendScript, a cloud video service, or a network
+   listener. Never call execute_extendscript or evaluate_expression.
+7. If any tool returns success: false, isError: true, or an error status,
+   stop. Show the error. Do not retry in a loop.
 
-## Environment bootstrap (read this section before using the workflow)
+## Keep these six values
 
-For a brand-new Windows machine, read [references/mcp-setup-windows.md](references/mcp-setup-windows.md) first. It covers one-time host provisioning, skill discovery, MCP config generation, verification, and the boundary between setup and the daily editing workflow.
+Set these values before analysis. Use the defaults when the user did not give a
+value.
 
-This skill is intended to be sufficient to configure the local environment. The canonical Hermes configuration for this repository is the project-scoped `<REPO_ROOT>\.codex\config.toml` in TOML format. Do not create a YAML `config.yaml` for this project and do not assume that merely listing the three server names registers them.
+| Name | Value |
+|---|---|
+| VIDEO_PATH | The user's absolute local video path. Ask if missing. |
+| STYLE | User's style; otherwise general. |
+| CLIP_SECONDS | User's target length; otherwise 45. |
+| MAX_CANDIDATES | 5. |
+| KEYWORDS | User's words; otherwise []. |
+| ANALYSIS_ID | Returned by highlight_local.analyze_video. |
 
-When any server is missing or the project has not been set up, resolve:
+Do not change CLIP_SECONDS below 10 or above 600. Do not use a different
+MAX_CANDIDATES unless the user asks for it.
 
-- `<REPO_ROOT>`: the folder containing `package.json` and `src\index.js`;
-- `<VIDEO_ROOT>`: the user's absolute local video folder;
-- `<HERMES_ROOT>`: normally `%LOCALAPPDATA%\hermes`;
-- local tools: `<REPO_ROOT>\tools\bin\ffmpeg.exe`, `ffprobe.exe`, and `yt-dlp.exe`.
+## Choose the next mode
 
-First trust the repository so Hermes loads this project-local copy instead of a stale user-level skill, then run the bootstrap script with the user's actual video folder. Preview before applying:
+- Missing server, package, config, or CEP extension → SETUP.
+- No explicit approved candidate IDs yet → ANALYZE.
+- The user explicitly approved candidate IDs → EDIT.
+- The user asks to save or render after editing → read the save/export section
+  in [references/operational-playbook.md](references/operational-playbook.md)
+  and ask for the exact output path before changing anything.
 
-```powershell
-Set-Location -LiteralPath "<REPO_ROOT>"
+If the user says “analyse and edit”, do ANALYZE, show candidates, and stop.
+The next user message must approve IDs before EDIT.
+
+## SETUP: one-time Windows setup
+
+Read [references/mcp-setup-windows.md](references/mcp-setup-windows.md) before
+changing the environment. Do not skip the preview command.
+
+1. REPO_ROOT is the folder containing package.json and src\index.js.
+   VIDEO_ROOT is the user's real absolute video folder. If either is unknown,
+   ask the user for it and stop.
+2. From REPO_ROOT, run:
+
+~~~powershell
 hermes skills trust "<REPO_ROOT>"
 $Bootstrap = "<REPO_ROOT>\.agents\skills\local-livestream-premiere\scripts\ensure-hermes-config.ps1"
 powershell -NoProfile -ExecutionPolicy Bypass -File $Bootstrap -RepoRoot "<REPO_ROOT>" -VideoRoot "<VIDEO_ROOT>"
+~~~
+
+3. If preview reports no errors and the user requested setup, run:
+
+~~~powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File $Bootstrap -RepoRoot "<REPO_ROOT>" -VideoRoot "<VIDEO_ROOT>" -Apply
-```
+~~~
 
-The script validates the Hermes Node runtime, the three local entrypoints, and the local FFmpeg/FFprobe/yt-dlp tools; writes/merges `<REPO_ROOT>\.codex\config.toml`, preserves unrelated settings, and backs up an existing project config before applying the managed server block. It registers the following servers:
+   For non-English media, pass the same -AsrModel value in both commands.
+4. If preview says the CEP extension is missing, install it only when setup is
+   authorized:
 
-| Server | Local entrypoint | Purpose |
-|---|---|---|
-| `video_context` | Hermes Node + `@smallthinkingmachines\video-context-mcp\dist\index.js` | transcript, timeline, search, keyframes/OCR; local FFmpeg/FFprobe/yt-dlp |
-| `highlight_local` | `<REPO_ROOT>\src\index.js` | local audio/scene/motion/transcript scoring and JSON/FCP7 handoff |
-| `premiere_cep` | Hermes Node + `adobe-premiere-pro-mcp\dist\index.js` | Premiere CEP connection and non-destructive assembly |
+~~~powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File $Bootstrap -RepoRoot "<REPO_ROOT>" -VideoRoot "<VIDEO_ROOT>" -Apply -InstallPremiereCep
+~~~
 
-Only use `-Apply` when the user has requested environment setup or explicitly approved writing the project config. For an analysis-only request, run the script in preview mode or report the missing setup instead.
+5. Start a new Hermes session, then run these checks:
 
-The generated environment also points both analysis servers at the local FFmpeg/FFprobe binaries, local cache directories, and the bundled Transformers runtime. `<VIDEO_ROOT>` is added to `HIGHLIGHT_ALLOWED_ROOTS`; never widen the allowlist to the whole machine. Do not commit the generated `.codex` config, cache, media, or user-specific paths.
-
-The bootstrap defaults to the English `Xenova/whisper-base.en` model. For multilingual or non-English media, pass an appropriate `-AsrModel` in both preview and apply so `video_context` and `highlight_local` stay aligned.
-
-If the Premiere CEP extension is missing, read the setup reference and—only when environment setup was requested or approved—run the same command with `-Apply -InstallPremiereCep`. This uses the installed Premiere MCP package's official Windows installer, backs up an existing `MCPBridgeCEP`, and does not write VS Code or Claude Desktop MCP configs.
-
-After applying the config, start a fresh Hermes session and verify all three server processes:
-
-```powershell
+~~~powershell
 hermes mcp list
 hermes mcp test video_context
 hermes mcp test highlight_local
 hermes mcp test premiere_cep
-```
+~~~
 
-An MCP process test is not a live Premiere test. Before editing, call `get_capabilities(checkConnection=false)`, then have the user open `Window > Extensions > MCP Bridge (CEP)`, set the exact generated `PREMIERE_TEMP_DIR`, and click `Save Configuration`, `Start Bridge`, and `Test Connection`. Finally call `verify_premiere_connection`; only a successful response authorizes the live editing phase. If a required executable, package entrypoint, FFmpeg binary, ASR runtime, extension, or connection is missing, report the exact failure and stop; do not substitute UXP, raw ExtendScript, cloud processing, or a network listener.
+6. A process test only proves that an MCP process starts. Before editing, in
+   Premiere Pro open Window > Extensions > MCP Bridge (CEP), set its Temp
+   Directory to the exact generated PREMIERE_TEMP_DIR, then click in order:
+   Save Configuration → Start Bridge → Test Connection.
 
-## Default local scoring profile
+The project config is <REPO_ROOT>\.codex\config.toml (TOML). Do not create a
+YAML config and do not commit .codex, cache, media, models, tools, projects,
+exports, or user-specific paths.
 
-- Keep transcript/ASR as the primary semantic signal. Preserve cue timestamps, short quotes, speech coverage, speaking rate, excitement terms, and punctuation evidence; treat noisy ASR as an approximation.
-- Enable the first three visual/audio signals by default: scene boundaries, low-weight motion, and relative audio bursts. Scene boundaries prefer clean clip edges; motion is a weak frame-difference signal rather than proof of an action; audio bursts are measured against the video's local baseline rather than a fixed dB threshold.
-- Score these signals in one-second evidence bins and return per-candidate evidence. A signal timeline is kept as a local analysis artifact for re-ranking and debugging; candidates remain the review-facing output.
-- Use scene boundaries for trimming and candidate generation, not as a standalone claim that a moment is interesting. Avoid double-counting correlated audio peak and loudness signals.
-- Objects and actions remain opt-in, label-driven detectors. Do not enable them merely because a model is available.
+## ANALYZE: default five-call route
 
-See [references/scoring-profile.md](references/scoring-profile.md) for the signal schema and weighting policy.
+This route uses highlight_local because it already returns ranked candidates
+with scores and evidence. It enables the requested first three practical
+signals: scene boundary, low-weight motion, and relative audio burst. It also
+uses transcript/ASR when available.
 
-## MCP tool map
+Use these Hermes tool names (the exact prefix may be shown by Hermes as
+mcp_highlight_local_*).
 
-Hermes registers MCP tools as `mcp_<server_name>_<tool_name>`. The expected servers are:
+### A1. Check the local scorer
 
-- `video_context`: `list_videos`, `ingest_video`, `get_ingest_status`, `get_video_timeline`, `search_videos`, `get_transcript`, and optionally `peek_frame`.
-- `highlight_local`: `server_info`, `analyze_video`, `get_analysis_status`, `get_frame`, and optionally `export_premiere_plan`.
-- `premiere_cep`: `get_capabilities`, `verify_premiere_connection`, project/sequence inspection tools, `import_media`, `duplicate_sequence`, `create_sequence_from_clips`, `add_to_timeline_batch`, `add_marker`, `set_active_sequence`, `list_sequence_tracks`, `validate_project_for_export`, plus `save_project`/export tools only when the user asks to persist or render.
+Call mcp_highlight_local_server_info with this input:
 
-All three server registrations are required for the complete workflow. If a tool is not exposed, run the bootstrap/verification checks first, then report the missing server/tool and continue only with a safe, clearly labeled fallback. Do not replace CEP with UXP.
+~~~json
+{}
+~~~
 
-## Default runbook
+Continue only when the result says:
 
-1. Confirm the absolute local video path and the requested cut style/length. If either materially changes the result and cannot be inferred, ask before analysis.
-2. Follow [references/operational-playbook.md](references/operational-playbook.md) for the low-token ASR search, candidate scoring, review gate, and Premiere assembly.
-3. If any MCP server is not already available, read [references/mcp-setup-windows.md](references/mcp-setup-windows.md) and complete the bootstrap/verification there. For non-default Hermes locations, pass the documented path overrides; the reference must agree with the generated TOML config.
-4. Return an analysis table containing ID, source start/end, duration, score, reason, short quote or visual cue, and evidence limitations. Include transcript, audio burst, scene boundary, and motion evidence when available.
-5. Stop after the candidate table until the user approves. “Analyze” alone is not permission to mutate Premiere; “use candidates highlight-002 and highlight-005” or an equivalent explicit instruction is.
-6. After approval, check capabilities, verify the live CEP connection, assemble the approved ranges in a new/duplicated sequence, add navigation markers, set the new sequence active, and verify tracks, gaps, offline media, and duration.
-7. Report what was changed, what remains unsaved/unexported, and the exact next approval needed.
+~~~text
+localOnly = true
+uxp = false
+networkListener = false
+~~~
 
-## Token-saving defaults
+### A2. Start analysis
 
-- Reuse an indexed `video_id` when the local path matches.
-- For a long video, ingest with `visual=false`, `embed=false`, and `whisper_fallback=true` first. This provides fast transcript search without building a large keyframe/OCR index.
-- Use `get_video_timeline` once, then run several short one- or two-term `search_videos` queries with a small limit and merge hits by timestamp. When semantic search is unavailable, compound queries can return no matches.
-- Slice `get_transcript` around promising hits instead of requesting the full transcript.
-- Only inspect frames for the final shortlist. If the index has no keyframes, use `highlight_local.get_frame` for a few timestamps or state that the score is transcript/audio-based.
+Call mcp_highlight_local_analyze_video with exactly these fields:
 
-## Completion criteria
+~~~json
+{
+  "video_path": "VIDEO_PATH",
+  "clip_length_seconds": 45,
+  "max_candidates": 5,
+  "style": "STYLE",
+  "keywords": []
+}
+~~~
 
-A task is complete only when the approved clips are in the requested new sequence and a read-only verification reports the expected clip counts, linked audio, no blocking gaps/offline media, and the actual duration. Do not claim that an MP4 or `.prproj` was saved unless the relevant operation succeeded.
+Replace the quoted values with the values in the table above. Save the returned
+analysisId as ANALYSIS_ID. Do not use analysis_id here.
+
+### A3. Poll analysis
+
+Call mcp_highlight_local_get_analysis_status with:
+
+~~~json
+{
+  "analysis_id": "ANALYSIS_ID",
+  "include_transcript": false
+}
+~~~
+
+If status is queued or running, call the same tool again later. Stop after 30
+polls. If status is error, stop. Continue only when status is completed.
+
+### A4. Make the candidate table
+
+Read result.candidates. For every candidate, copy these exact fields:
+
+~~~text
+id, startSeconds, endSeconds, durationSeconds, score, reasons, quote, evidence
+~~~
+
+Return this table and nothing that implies a visual fact not present in
+evidence:
+
+| ID | Source start–end | Seconds | Score | Reason | Quote / visual evidence | Limit |
+|---|---|---:|---:|---|---|---|
+
+Say that the score is a local ranking aid, not truth. Say whether transcript,
+audio burst, scene boundary, and motion evidence were available. If transcript
+is missing, say no transcript; audio/scene/motion only.
+
+### A5. Stop for approval
+
+End with this exact request:
+
+~~~text
+請只回覆要剪的候選 ID，例如：使用 highlight-001、highlight-003。
+我在收到 ID 前不會修改 Premiere。
+~~~
+
+Do not call any Premiere tool after A5.
+
+### Optional video_context route
+
+Use video_context only when the user specifically asks for transcript/topic
+search, or when highlight_local cannot provide analysis. Do not invent a
+0–100 score from search hits. Use this order only:
+
+1. mcp_video_context_ingest_video with
+   {"url_or_path":"VIDEO_PATH","visual":false,"embed":false,"whisper_fallback":true}.
+2. Poll mcp_video_context_get_ingest_status with the returned video_id
+   until stage is done; stop on error.
+3. Call mcp_video_context_get_video_timeline once.
+4. Call mcp_video_context_search_videos with one short query and limit: 5.
+5. Call mcp_video_context_get_transcript only around a promising hit.
+
+Use the results as transcript evidence, then run the default highlight_local
+route if a scored candidate table is required.
+
+### Optional JSON/FCP7 handoff
+
+Use this only when the user explicitly asks for a local handoff file. Require
+approved candidate IDs first, then call
+mcp_highlight_local_export_premiere_plan once:
+
+~~~json
+{
+  "analysis_id": "ANALYSIS_ID",
+  "candidate_ids": ["highlight-001"],
+  "output_dir": "LOCAL_OUTPUT_DIR",
+  "name": "ai-highlights",
+  "sequence_name": "AI Highlights",
+  "include_xml": true,
+  "overwrite": false
+}
+~~~
+
+Require success=true. This creates local JSON/FCP7 files only; it does not
+connect to or edit Premiere. Do not set overwrite=true unless the user asks to
+replace an existing file.
+
+## EDIT: fixed non-destructive Premiere route
+
+Enter this section only after the user approved IDs that exist in the last
+candidate table. Use the approval order as the timeline order.
+
+For 9B mode, the user must have the desired source sequence open in Premiere,
+or the project must contain exactly one sequence. This avoids guessing a
+sequence and avoids an unknown native preset. If there are multiple sequences
+and no active sequence ID, stop and ask the user to open the source sequence.
+
+Use only these premiere_cep tools, in this order:
+
+### E1. Check CEP installation
+
+Call mcp_premiere_cep_get_capabilities:
+
+~~~json
+{
+  "checkConnection": false
+}
+~~~
+
+Continue only when:
+
+~~~text
+success = true
+bridge.cep.status = "installed"
+~~~
+
+If update.available=true and the update is not snoozed, ask Update now or Later
+and stop.
+
+### E2. Check the live bridge
+
+Call mcp_premiere_cep_verify_premiere_connection with {}. Continue only when
+success=true and status=connected. A successful result may have
+activeSequence=null; that means only that no sequence is active.
+
+If this call fails, tell the user to start the CEP panel. Do not retry in a
+loop and do not edit.
+
+### E3. Find the source sequence
+
+- If E2 returned activeSequence.id, set SOURCE_SEQUENCE_ID to that value.
+- Otherwise call mcp_premiere_cep_list_sequences with {}.
+- If the result has count=1, set SOURCE_SEQUENCE_ID to sequences[0].id.
+- If the result has count=0, stop and ask the user to create/open one source
+  sequence.
+- If the result has more than one sequence, stop and ask the user to open the
+  desired source sequence, then run EDIT again.
+- If list_sequences returns an error, stop. Do not keep calling it.
+
+### E4. Duplicate, never clear the original
+
+Call mcp_premiere_cep_duplicate_sequence:
+
+~~~json
+{
+  "sequenceId": "SOURCE_SEQUENCE_ID",
+  "newName": "AI Highlights",
+  "clearContents": true
+}
+~~~
+
+Continue only when success=true and newSequenceId is present. Set
+TARGET_SEQUENCE_ID to newSequenceId. The original sequence ID must never be
+used as the destination.
+
+### E5. Import the source media
+
+Call mcp_premiere_cep_import_media:
+
+~~~json
+{
+  "filePath": "VIDEO_PATH"
+}
+~~~
+
+Continue when success=true and save the returned id as MEDIA_ID.
+alreadyImported=true is okay; still use its returned id.
+
+### E6. Place approved clips in one batch
+
+Create one clip object per approved candidate. Start CURSOR at 0. For each
+candidate in approval order, use the previous cursor as time, then add that
+candidate's durationSeconds to the cursor for the next clip.
+
+Call mcp_premiere_cep_add_to_timeline_batch once with this shape:
+
+~~~json
+{
+  "sequenceId": "TARGET_SEQUENCE_ID",
+  "clips": [
+    {
+      "projectItemId": "MEDIA_ID",
+      "trackIndex": 0,
+      "time": 0,
+      "linkAudio": true,
+      "sourceInPoint": 12.5,
+      "sourceOutPoint": 57.5
+    }
+  ]
+}
+~~~
+
+Replace the example values with every approved candidate. Continue only when
+success=true, status=success, failed=0, and placed=total.
+If the result is partial, failure, or success=false, stop and report the
+per-clip results; do not retry automatically.
+
+### E7. Show and verify the new sequence
+
+1. Call mcp_premiere_cep_set_active_sequence with
+   {"sequenceId":"TARGET_SEQUENCE_ID"}. Require success=true.
+2. Call mcp_premiere_cep_list_sequence_tracks with
+   {"sequenceId":"TARGET_SEQUENCE_ID"}.
+3. Call mcp_premiere_cep_validate_project_for_export with:
+
+~~~json
+{
+  "sequenceId": "TARGET_SEQUENCE_ID",
+  "requireNonEmptyTimeline": true,
+  "checkGaps": true
+}
+~~~
+
+Require success=true, readyForExport=true, summary.offlineMediaCount=0,
+and summary.gapCount=0. If any requirement fails, report it as unfinished.
+
+Do not add markers in the minimal 9B route. Add add_marker only if the user
+explicitly asks for markers; it is optional and does not replace verification.
+
+## EDIT completion message
+
+After E7, report:
+
+~~~text
+完成：已建立新 sequence「AI Highlights」並放入 N 個核准片段。
+原始 sequence 未修改。
+Premiere sequence 已驗證；專案尚未儲存，影片尚未輸出。
+~~~
+
+Replace N with the verified count. Never say that a project or MP4 was saved
+unless the save/render tool returned success after separate approval.
+
+## What is intentionally not enabled
+
+Do not call object or action detectors. They are not part of the current
+default local scorer. The current transparent score uses transcript when
+available, relative audio energy/burst, scene boundaries, and low-weight motion;
+the evidence returned by highlight_local is the source of truth for the
+candidate table.
+
+For signal definitions and weights, read
+[references/scoring-profile.md](references/scoring-profile.md). For save,
+export, or detailed troubleshooting, read
+[references/operational-playbook.md](references/operational-playbook.md).

@@ -1,281 +1,259 @@
 # Premiere Pro Livestream Highlight Solution
 
-這個 repository 是一套本機優先的自動剪輯 solution，不只是單一 MCP server。它把
-影片理解、透明 highlight 評分、人工核准與 Adobe Premiere Pro 實際剪輯串成一條
-可驗證、可回復的流程。
+這個 repository 是「本機影片分析 → 候選片段 → 使用者核准 → Premiere Pro
+非破壞性剪輯」的完整 solution。它不是單一 Premiere MCP，而是三個本地 MCP
+server 加上一個給 Hermes agent 使用的 canonical skill。
 
-> 重要：Git clone 只會取得本 repository 的 `highlight_local` 與 agent workflow。
-> `video_context`、`premiere_cep`、FFmpeg/FFprobe/yt-dlp、ASR model，以及
-> Premiere CEP extension 都是新機器上必須另外 provision 的本地依賴。
+## 先看這張圖
 
-## Solution 組成
-
-| 元件 | 來源 | 負責內容 | 是否修改 Premiere |
-|---|---|---|---|
-| `video_context` | Hermes Node 內的 `@smallthinkingmachines/video-context-mcp` | ingest、ASR/transcript、timeline、search、keyframes、OCR | 否 |
-| `highlight_local` | 本 repository 的 `src/index.js` | sidecar/本地 ASR、audio、scene、motion、透明評分、JSON/FCP7 XML handoff | 否 |
-| `premiere_cep` | Hermes Node 內的 `adobe-premiere-pro-mcp` | 透過 Premiere CEP bridge 匯入媒體、建立 sequence、放置片段、marker、驗證、儲存與輸出 | 是，僅在核准後 |
-| `local-livestream-premiere` | `.agents/skills/local-livestream-premiere` | 告訴 agent 如何設定、路由三個 MCP、等待核准並安全完成剪輯 | 依 workflow 階段而定 |
-
-~~~mermaid
-flowchart LR
-    A[本地影片] --> B[video_context<br/>ASR / timeline / search]
-    A --> C[highlight_local<br/>audio / scene / motion / transcript]
-    B --> D[Timestamped candidates]
-    C --> D
-    D --> E{使用者明確核准？}
-    E -->|否| F[停止；不修改 Premiere]
-    E -->|是| G[premiere_cep]
-    G --> H[CEP Bridge panel]
-    H --> I[新建或複製的 highlight sequence]
-    I --> J[Tracks / gaps / offline media 驗證]
-    C -.核准後可選.-> K[JSON / FCP7 XML handoff]
+~~~text
+本地影片
+   |
+   +--> highlight_local: 預設評分（transcript + audio + scene + motion）
+   |        |
+   |        +--> 候選表（ID / 時間 / 分數 / 證據）
+   |
+   +--> video_context: 只有需要主題搜尋或額外 transcript 證據時使用
+            |
+            v
+      使用者明確核准 candidate IDs
+            |
+            v
+   premiere_cep: CEP bridge -> 複製 source sequence -> 放入 approved clips
+            |
+            v
+      tracks + gaps + offline media 驗證
+            |
+            v
+   sequence 完成；預設不 save、不 render
 ~~~
 
-## Agent 從哪裡開始
+重要順序：
 
-Repository 內有兩個 agent-facing 入口：
+1. 先分析，不碰 Premiere。
+2. 顯示候選後停止，等待使用者明確核准 ID。
+3. 核准後才驗證 CEP、複製 sequence、匯入影片、放置片段。
+4. 驗證完成後仍不自動儲存或輸出。
 
-- `AGENTS.md`：所有在此 repository 工作的 agent 都應先遵守的 solution 邊界。
-- `.agents/skills/local-livestream-premiere/SKILL.md`：Hermes 的 canonical repo-local skill。
+## 三個 MCP 各自做什麼
 
-Hermes 只會在受信任的 repository 內自動載入 `.agents/skills` 或
-`.hermes/skills`。第一次 clone 後，從 repository root 執行：
+| Server | 來源 | 主要工作 | 何時使用 |
+|---|---|---|---|
+| video_context | Hermes Node 的 @smallthinkingmachines/video-context-mcp | ingest、ASR、transcript、timeline、主題搜尋、keyframe/OCR | 額外搜尋/證據；不是預設評分器 |
+| highlight_local | 本 repository 的 src/index.js | 本地 transcript、相對 audio、scene boundary、低權重 motion 評分；JSON/FCP7 handoff | 每次分析的預設入口 |
+| premiere_cep | Hermes Node 的 adobe-premiere-pro-mcp | CEP 連線、sequence、import、timeline、驗證、save/render | 只有明確核准後 |
+
+三個 server 都必須在環境中註冊，但不必每一次請求都呼叫三個。最短可靠路徑
+是 highlight_local 分析，核准後才使用 premiere_cep。video_context 是可選的
+transcript/search 證據工具。
+
+## Hermes agent 從哪裡開始
+
+Agent 必須先遵守 AGENTS.md，再讀 canonical skill：
+
+[.agents/skills/local-livestream-premiere/SKILL.md](.agents/skills/local-livestream-premiere/SKILL.md)
+
+第一次 clone 後，從 repository root 執行：
 
 ~~~powershell
 hermes skills trust "<REPO_ROOT>"
 hermes skills list --source all
 ~~~
 
-Project-local skill 是最高優先層。這可避免 `%LOCALAPPDATA%\hermes\skills` 內的
-舊版同名 skill 覆蓋本 repository 的 workflow。設定完成後，從 repository root
-開啟新的 Hermes session，再呼叫：
+確認看到 local-livestream-premiere 後，開啟新的 Hermes session。不要讓使用者
+層的舊版同名 skill 覆蓋 repo-local 版本。
+
+## 9B local LLM 快速操作卡
+
+Canonical skill 已把這條流程寫成固定操作。這裡只保留判斷規則，方便人類檢查。
+
+### 分析前固定值
+
+| 變數 | 預設 |
+|---|---|
+| VIDEO_PATH | 使用者提供的絕對本機影片路徑；沒有就詢問 |
+| STYLE | general |
+| CLIP_SECONDS | 45（允許 10–600） |
+| MAX_CANDIDATES | 5 |
+| KEYWORDS | [] |
+
+### ANALYZE
+
+Hermes 依序呼叫：
+
+1. mcp_highlight_local_server_info({})
+2. mcp_highlight_local_analyze_video({video_path, clip_length_seconds, max_candidates, style, keywords})
+3. mcp_highlight_local_get_analysis_status({analysis_id, include_transcript:false})
+   直到 status=completed；最多 30 次，error 就停止。
+
+回傳 result.candidates 的 id、startSeconds、endSeconds、durationSeconds、
+score、reasons、quote、evidence。
+
+候選表至少要有：
+
+| ID | source start–end | duration | score | reason | quote/evidence | limitation |
+|---|---|---:|---:|---|---|---|
+
+然後輸出：
 
 ~~~text
-/local-livestream-premiere
+請只回覆要剪的候選 ID，例如：使用 highlight-001、highlight-003。
+我在收到 ID 前不會修改 Premiere。
 ~~~
 
-詳細文件：
+分析、找亮點、顯示候選，都不是 Premiere 編輯授權。
 
-- [全新 Windows 機器部署](.agents/skills/local-livestream-premiere/references/mcp-setup-windows.md)
-- [實際分析與剪輯 runbook](.agents/skills/local-livestream-premiere/references/operational-playbook.md)
-- [本地 scoring profile](.agents/skills/local-livestream-premiere/references/scoring-profile.md)
+### EDIT
 
-## 全新 Windows 機器快速部署
+只有收到候選 ID 後，依序呼叫：
 
-以下是最短的正確路徑；完整例外與 troubleshooting 請看上面的部署文件。
+~~~text
+get_capabilities(checkConnection=false)
+verify_premiere_connection
+list_sequences（只有 activeSequence 為 null 時需要）
+duplicate_sequence(clearContents=true)
+import_media
+add_to_timeline_batch(linkAudio=true)
+set_active_sequence
+list_sequence_tracks
+validate_project_for_export
+~~~
 
-### 1. 準備主機
+固定成功條件：
 
-需要：
+- get_capabilities：success=true 且 bridge.cep.status=installed。
+- verify_premiere_connection：success=true 且 status=connected。
+- duplicate_sequence：success=true 且有 newSequenceId。
+- import_media：success=true 且有 id。
+- add_to_timeline_batch：success=true、status=success、failed=0、
+  placed=total。
+- 最後驗證：readyForExport=true、offlineMediaCount=0、gapCount=0。
 
-- Windows PowerShell、Git、Node.js 22+ 與 npm。
-- Hermes agent，以及同一 Hermes Node tree 內的 `video-context-mcp` 和
-  `adobe-premiere-pro-mcp`。
+9B 簡化模式要求 Premiere 已有一個 source sequence：
+
+- 有 activeSequence.id 就使用它。
+- 沒有 active sequence 且 list_sequences.count=1 就使用唯一 sequence。
+- count=0 或 count>1 就停止，請使用者建立/開啟正確的 source sequence。
+- 不猜 sequence、不猜 .sqpreset，不使用 create_sequence_from_clips。
+- 原始 sequence 只作為複製來源，永遠不是 timeline 寫入目的地。
+
+任何 success=false、isError=true、partial、驗證錯誤，都停止並報告；不做盲目
+重試。最小模式不加 marker。儲存 .prproj 或 render MP4 必須另一次明確授權。
+
+## Scoring 行為
+
+highlight_local 是透明 heuristic，不是語意真相。預設訊號：
+
+- transcript/ASR：有字幕時作主要語意證據；
+- audio energy / relative audio burst：相對於同一影片的 local baseline；
+- scene boundary：協助切點與候選生成，不代表亮點；
+- motion：低權重 frame difference，只能作輔助證據。
+
+Objects/actions 目前不是預設 detector，不能因為工具存在就自行啟用。完整欄位與
+權重請看 [scoring-profile.md](.agents/skills/local-livestream-premiere/references/scoring-profile.md)。
+
+如果使用者只要交接檔而不是 live Premiere edit，在候選 ID 核准後才呼叫
+highlight_local.export_premiere_plan，使用 local output directory、
+include_xml=true、overwrite=false。JSON/FCP7 檔案不是 Premiere 已完成剪輯。
+
+## 全新 Windows 機器部署
+
+完整且可逐步執行的文件在
+[mcp-setup-windows.md](.agents/skills/local-livestream-premiere/references/mcp-setup-windows.md)。
+
+### 先決條件
+
+- Windows PowerShell、Git、Node.js 22+、npm、Hermes。
 - Adobe Premiere Pro。
-- 本地影片資料夾。
-- `ffmpeg.exe`、`ffprobe.exe`、`yt-dlp.exe`，預設放在
-  `<REPO_ROOT>\tools\bin`。
-- 已預先 provision 的本地 ASR runtime/model cache，或同名 `.srt`/`.vtt` sidecar。
+- repository 本身的 npm ci dependencies。
+- Hermes Node tree 中的 video-context-mcp 與 adobe-premiere-pro-mcp。
+- ffmpeg.exe、ffprobe.exe、yt-dlp.exe，預設在
+  <REPO_ROOT>\tools\bin。
+- 本地 ASR runtime/model cache，或明確的 .srt/.vtt sidecar。
 
-### 2. Clone 並安裝 repository dependencies
+### 最短部署步驟
 
 ~~~powershell
 $RepoRoot = 'C:\Work\Premiere-Pro-MCP-Server'
 $VideoRoot = 'D:\Videos\Livestreams'
+
 git clone https://github.com/birdie-hsu/Premiere-Pro-MCP-Server.git $RepoRoot
 Set-Location -LiteralPath $RepoRoot
 npm ci
 npm test
 hermes skills trust $RepoRoot
-~~~
 
-### 3. Preview，再生成三個 MCP 的 project config
-
-Canonical config 是 `<REPO_ROOT>\.codex\config.toml`。不要建立舊式 YAML
-`config.yaml`，也不要 commit 這個含使用者絕對路徑的檔案。
-
-~~~powershell
 $Bootstrap = Join-Path $RepoRoot '.agents\skills\local-livestream-premiere\scripts\ensure-hermes-config.ps1'
 powershell -NoProfile -ExecutionPolicy Bypass -File $Bootstrap -RepoRoot $RepoRoot -VideoRoot $VideoRoot
 powershell -NoProfile -ExecutionPolicy Bypass -File $Bootstrap -RepoRoot $RepoRoot -VideoRoot $VideoRoot -Apply
 ~~~
 
-Preview 會先驗證 Hermes Node、三個 entrypoint、媒體工具和 local Transformers
-runtime。`-Apply` 只在 setup 已被要求或核准後使用；它會保留無關設定，並在改寫
-既有 config 前建立 timestamped backup。
-
-預設 ASR model 是英文 `Xenova/whisper-base.en`。非英文或多語影片應在 preview
-與 apply 都傳入相同的 `-AsrModel`，例如
-`-AsrModel 'Xenova/whisper-base'`。
-
-### 4. 安裝或更新 Premiere CEP extension
-
-若 bootstrap 顯示 CEP extension missing，使用明確的 opt-in switch：
+先 preview，再 -Apply。非英文影片在兩次 command 都傳同一個 -AsrModel。如果 CEP
+extension 缺少，且使用者已授權 setup，再執行：
 
 ~~~powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File $Bootstrap -RepoRoot $RepoRoot -VideoRoot $VideoRoot -Apply -InstallPremiereCep
 ~~~
 
-`-InstallPremiereCep` 會使用已安裝的 `adobe-premiere-pro-mcp` 官方 Windows
-installer，更新目前使用者的 `MCPBridgeCEP` extension、啟用 Adobe CEP debug
-mode，並建立與 `PREMIERE_TEMP_DIR` 相同的 bridge directory。它不會改寫
-Claude Desktop 或 VS Code MCP config。因為它會替換既有同名 CEP extension，
-agent 必須在使用者要求 setup 或明確核准後才使用。
+bootstrap 會生成 project-scoped .codex\config.toml，驗證三個 entrypoint、Node、
+FFmpeg/FFprobe/yt-dlp 和 ASR runtime，並在覆寫既有 config 前建立 backup。不要
+commit .codex 或任何使用者路徑。
 
-### 5. 啟動 Premiere bridge
+### Premiere bridge 必做步驟
 
-1. 關閉並重新開啟 Premiere Pro。
-2. 開啟 `Window > Extensions > MCP Bridge (CEP)`。
-3. 將 panel 的 `Temp Directory` 設成 bootstrap 顯示的
-   `PREMIERE_TEMP_DIR` 完整路徑。
-4. 依序按 `Save Configuration`、`Start Bridge`、`Test Connection`。
-5. 重新啟動 Hermes 或開啟新的 session。
+1. 重開 Premiere Pro。
+2. 開啟 Window > Extensions > MCP Bridge (CEP)。
+3. Temp Directory 填入 bootstrap 顯示的完整 PREMIERE_TEMP_DIR。
+4. 依序按 Save Configuration、Start Bridge、Test Connection。
+5. 重新開啟 Hermes session。
+6. 先跑 get_capabilities(checkConnection=false)，再跑
+   verify_premiere_connection。
 
-如果 panel 沒出現在 Extensions，先確認 CEP extension 已安裝；必要時在 Premiere
-preferences 啟用 plugin developer mode，重啟 Premiere，再開啟 CEP panel。本
-solution 不使用 bundled experimental UXP panel。
+### Readiness 不可混淆
 
-### 6. 驗證 readiness
+| 檢查 | 只代表 |
+|---|---|
+| bootstrap preview | 本機路徑、package、tool、runtime 存在 |
+| hermes mcp test premiere_cep | stdio MCP process 能啟動 |
+| get_capabilities(checkConnection=false) | CEP extension/bridge 安裝可被檢查 |
+| verify_premiere_connection | Premiere panel 與 live CEP bridge 可回應 |
 
-~~~powershell
-hermes mcp list
-hermes mcp test video_context
-hermes mcp test highlight_local
-hermes mcp test premiere_cep
-~~~
-
-Readiness 有四層，不可混為一談：
-
-| 層級 | 驗證 | 代表意義 |
-|---|---|---|
-| 0. Files | bootstrap preview | executable、package entrypoint、tool 和路徑存在 |
-| 1. MCP process | `hermes mcp test premiere_cep` | stdio server 能啟動並列出 tools；不代表 Premiere 可剪輯 |
-| 2. Bridge install | `premiere_cep.get_capabilities(checkConnection=false)` | CEP extension、bridge directory 與本機能力可被檢查 |
-| 3. Live Premiere | `premiere_cep.verify_premiere_connection` | panel 已啟動、project/host 可回應；只有這層通過後才可剪輯 |
-
-若 live check 失敗，開啟/啟動 panel 並修正 Temp Directory；不要重試迴圈，也不要
-切換到 UXP、raw ExtendScript、cloud service 或 network listener。
-
-## Runtime workflow
-
-### 1. DISCOVER
-
-取得使用者提供的絕對本地影片路徑、highlight 風格與目標長度。不要掃描整台機器。
-`highlight_local` 只接受 `HIGHLIGHT_ALLOWED_ROOTS` 內的路徑。
-
-### 2. ANALYZE
-
-長影片優先用 `video_context` 的 ASR-first route：
-
-1. `list_videos`，重用相同 source 的 `video_id`。
-2. 必要時 `ingest_video`，長影片先用
-   `visual=false`、`embed=false`、`whisper_fallback=true`。
-3. Poll `get_ingest_status`，再讀一次 `get_video_timeline`。
-4. 用數個短 query 執行 `search_videos`，對命中區間切片
-   `get_transcript`。
-5. 只對 shortlist 使用 `peek_frame` 或 `highlight_local.get_frame`。
-
-`highlight_local` 是透明 heuristic fallback，也可補充相對 audio burst、scene
-boundary、低權重 frame-difference motion 與 reusable plan。Objects/actions
-不是預設訊號。
-
-### 3. REVIEW
-
-回傳候選表，至少包含 ID、source start/end、duration、0–100 score、理由、短
-quote/visual cue 和 evidence limitations。Score 只是排序工具，不是語意真相。
-
-分析完成後停止。`analyze`、`show candidates` 或 `find highlights` 都不是修改
-Premiere 的授權。
-
-### 4. ASSEMBLE
-
-只有使用者明確核准 candidate ID 或時間範圍後：
-
-1. `get_capabilities(checkConnection=false)`。
-2. `verify_premiere_connection`；失敗就停止。
-3. Read-only 檢查 project、active sequence、tracks 和 media。
-4. 優先 `duplicate_sequence(clearContents=true)`，保留原始 sequence 的設定與內容。
-   若沒有可複製來源，使用 `create_sequence_from_clips`，或提供真實 `.sqpreset`
-   給 `create_sequence`，避免觸發 Premiere native dialog。
-5. `import_media`，取得真實 `projectItemId`。
-6. `add_to_timeline_batch`，對每個核准片段設定 source in/out、timeline cursor、
-   `trackIndex=0`、`linkAudio=true`。
-7. 用實際回傳的 start/out point 推進 cursor 並加入 markers。
-8. `set_active_sequence` 讓使用者看到新 sequence。
-
-`verify_premiere_connection` 成功但回傳 `activeSequence: null` 並不代表 bridge
-失敗；此時不可憑空呼叫 `duplicate_sequence`，應改走
-`create_sequence_from_clips`，或使用使用者指定的真實 sequence。
-
-### 5. VERIFY
-
-對新 sequence 執行 `list_sequence_tracks` 與
-`validate_project_for_export(requireNonEmptyTimeline=true, checkGaps=true)`，確認：
-
-- video/audio clip 數量符合預期；
-- linked audio、來源路徑與 in/out 正確；
-- 沒有 blocking gaps；
-- `offlineMediaCount=0`；
-- 實際 duration 符合組裝結果。
-
-每個 mutation 都要用最窄的 read-only tool 驗證。Tool 回傳
-`success:false` 是停止條件，不可直接盲目重試。
-
-### 6. PERSIST / EXPORT
-
-編輯核准不等於儲存或輸出核准：
-
-- `save_project` 會覆寫目前 `.prproj`，使用前再次取得明確授權。
-- 有新路徑時優先 `save_project_as`，既有 target 不得靜默覆寫。
-- MP4 export 前確認 output path、preset 與 overwrite 行為，再驗證並輸出。
-- 未要求時清楚回報「sequence 已建立，但尚未儲存/輸出」。
-
-## JSON / FCP7 XML fallback
-
-核准候選後，`highlight_local.export_premiere_plan` 可以生成 non-destructive JSON
-plan 與 FCP7 XML。這是 live CEP 不可用或使用者明確想要 handoff file 時的 fallback；
-產生檔案不等於 Premiere 已完成剪輯。既有輸出預設拒絕覆寫。
+只有最後一項成功才可以修改 Premiere。
 
 ## 安全邊界
 
-- 所有 source media 與 analysis artifact 保持本機。
-- Agent 不直接呼叫 UXP 或 raw ExtendScript；Premiere 操作一律經
-  `premiere_cep` 的 CEP tool surface。
-- 不以 cloud video service 或 network listener 當 fallback。
-- 原始 sequence 保留；剪輯在新建或複製的 sequence 進行。
-- 不刪除 source media、sequence 或 project item，除非使用者明確要求。
-- 不 commit `.codex`、`.cache`、`node_modules`、`tools\bin`、影片、project
-  或使用者絕對路徑。
+- 所有影片、ASR、cache、分析結果留在本機。
+- 只接受 allowlist 內的絕對路徑，不掃描整台電腦。
+- 不用 UXP、raw ExtendScript、cloud video service、network listener。
+- 原始 sequence 保留；只在新複製的 AI Highlights sequence 放片段。
+- 不自動 save、render 或覆寫既有輸出。
+- 不 commit .codex、.cache、node_modules、tools\bin、影片、Premiere
+  project、exports 或使用者絕對路徑。
 
 ## Repository map
 
 | 路徑 | 內容 |
 |---|---|
-| `src/index.js` | `highlight_local` STDIO MCP entrypoint |
-| `src/server.js` | 5 個本地分析/plan tools |
-| `src/analysis.js`、`src/scoring.js` | analysis pipeline 與透明 scoring |
-| `src/ffmpeg.js`、`src/motion.js`、`src/transcribe.js` | 本地音訊、scene、motion、ASR |
-| `src/premiere-xml.js` | JSON plan 與 FCP7 XML handoff |
-| `.agents/skills/local-livestream-premiere` | canonical agent workflow、references、bootstrap |
-| `test/unit.test.js` | captions、signals、allowlist、Premiere handoff 測試 |
+| src/index.js | highlight_local STDIO MCP entrypoint |
+| src/server.js | local analysis/plan tools |
+| src/analysis.js / src/scoring.js | analysis pipeline and scoring |
+| src/ffmpeg.js / src/motion.js / src/transcribe.js | local media/ASR |
+| src/premiere-xml.js | JSON/FCP7 XML handoff |
+| .agents/skills/local-livestream-premiere | canonical skill, references, bootstrap |
+| test/unit.test.js | local scoring, signals, allowlist, handoff tests |
 
-## 開發與驗證
+## 驗證
 
 ~~~powershell
 npm ci
 npm test
 node --check src\index.js
-~~~
-
-完整 solution 驗證還要包含：
-
-~~~powershell
 hermes skills list --source all
 hermes mcp test video_context
 hermes mcp test highlight_local
 hermes mcp test premiere_cep
 ~~~
 
-最後由 agent 呼叫 `get_capabilities` 與 `verify_premiere_connection`，才能確認
-Premiere live editing readiness。
+最後必須以 premiere_cep.get_capabilities 和
+premiere_cep.verify_premiere_connection 確認 live readiness；process test 本身
+不足以宣稱可以剪輯。

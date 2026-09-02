@@ -26,6 +26,32 @@ The analysis JSON reports the enabled signal names and the path to the local `si
 - Audio peak and audio burst belong to one audio evidence family. Do not count them as two independent modalities for a multi-signal boost.
 - Objects/actions are disabled unless the user or content profile supplies explicit labels and the required local detector is available.
 
+The current implementation uses these weights. The agent must not recalculate or
+replace the returned score; this table is for explaining a result.
+
+With transcript evidence:
+
+~~~text
+score = 100 * (
+  audioEnergy * 0.22 + audioBurst * 0.08 + excitement * 0.30 +
+  speechDensity * 0.13 + speakingRate * 0.07 + sceneScore * 0.06 +
+  sceneBoundary * 0.04 + punctuation * 0.05 + motionEnergy * 0.05
+)
+~~~
+
+Without transcript evidence:
+
+~~~text
+score = 100 * (
+  audioEnergy * 0.43 + audioBurst * 0.17 + sceneScore * 0.18 +
+  sceneBoundary * 0.08 + motionEnergy * 0.14
+)
+~~~
+
+For the small Hermes model, copy the score from result.candidates and copy its
+evidence. Do not make a second score from the transcript or from video_context
+search results.
+
 ## Selection and review
 
 Generate candidate starts from audio peaks, transcript cues, and scene boundaries, then rank fixed windows with transparent evidence and reject excessive overlap. When a natural-length selector is available, merge nearby evidence regions, constrain minimum/maximum duration, and rank by score density before applying the non-overlap/coverage rule.
