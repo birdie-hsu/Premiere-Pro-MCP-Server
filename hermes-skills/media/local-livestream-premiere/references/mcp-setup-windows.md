@@ -1,74 +1,349 @@
-# Windows Hermes/MCP setup
+# 全新 Windows 機器部署 'local-livestream-premiere'
 
-This repository uses the project-scoped Hermes configuration at:
+本文件把「全新機器 → Hermes → 三個本地 MCP → Premiere Pro CEP 剪輯」整理成
+可重複執行的部署流程。部署完成後，Hermes agent 可以讀取本 skill，分析本地
+livestream，並在使用者明確核准後把片段組成 Premiere sequence。
 
-```text
-<REPO_ROOT>\.codex\config.toml
-```
+| MCP server | 階段 | 負責內容 |
+|---|---|---|
+| 'video_context' | 分析 | 本地轉錄、時間軸、語意搜尋、keyframe/OCR |
+| 'highlight_local' | 分析/交接 | scene、motion、audio、transcript 評分，以及 JSON/FCP7 handoff |
+| 'premiere_cep' | 剪輯 | 透過 CEP bridge 連接 Premiere，建立非破壞性 sequence |
 
-The format is TOML. Do not use the old YAML `config.yaml` example or paste a block containing unresolved `<REPO_ROOT>`/`<HERMES_ROOT>` placeholders into a live config.
+三個 server 不一定同時執行。正常順序是先用 'video_context' 分析，再由
+'highlight_local' 補充評分或交接；只有使用者明確核准候選片段後，才調用
+'premiere_cep' 修改 Premiere。
 
-## Required local layout
+## 完成定義
 
-The bootstrap expects these paths unless explicit overrides are supplied:
+從 repository root 開啟新的 Hermes session 後，應能確認：
 
-```text
+1. Hermes 找得到並啟用 'local-livestream-premiere' skill。
+2. project-scoped <REPO_ROOT>\.codex\config.toml 已註冊三個 server。
+3. 三個 'hermes mcp test' 都能通過連線測試。
+4. Premiere Pro 已安裝並能開啟 CEP bridge panel。
+5. 影片、轉錄、cache、分析結果和暫存檔都留在本機。
+
+只複製 repository 再讀取 skill 不足以完成全新機器部署。Skill 會自動化設定與
+檢查，但不會替代一次性的主機 provisioning。
+
+## 0. 準備路徑與先決條件
+
+先在 PowerShell 設定新機器的實際絕對路徑：
+
+~~~powershell
+$RepoRoot = 'C:\Work\Premiere Pro MCP'
+$VideoRoot = 'D:\Videos\Livestreams'
+$HermesRoot = Join-Path $env:LOCALAPPDATA 'hermes'
+~~~
+
+需要準備：
+
+| 項目 | 用途 | 檢查 |
+|---|---|---|
+| Git | 取得 repository | 'git --version' |
+| Node.js/npm | 安裝與測試本地 MCP | 'node --version'、'npm --version' |
+| Hermes agent | skill discovery、MCP 啟動和 tool routing | 'hermes --version' |
+| Adobe Premiere Pro | 匯入影片與編輯 sequence | 啟動應用程式 |
+| Premiere CEP bridge | 讓 'premiere_cep' 連到 Premiere | 安裝並開啟 bridge panel |
+| 本地影片資料夾 | source media | 必須是現存絕對資料夾 |
+| FFmpeg、FFprobe、yt-dlp | 本地媒體探勘和分析 | 放在 'tools\bin' |
+| Hermes Node/MCP packages | 啟動兩個 Hermes-side server | 見第 3 節 |
+
+~~~powershell
+git --version
+node --version
+npm --version
+hermes --version
+Test-Path -LiteralPath $VideoRoot -PathType Container
+~~~
+
+若 'hermes' 找不到，先安裝 Hermes 並讓它加入目前使用者的 PATH。若 Premiere
+或 CEP bridge 尚未安裝，先完成安裝；不要用 UXP、raw ExtendScript、cloud
+video service 或 network listener 代替 CEP。
+
+## 1. 取得 repository 並安裝本地 server
+
+~~~powershell
+git clone '<REPOSITORY_URL>' $RepoRoot
+Set-Location -LiteralPath $RepoRoot
+npm ci
+npm test
+~~~
+
+'npm ci' 只會安裝 repository 的 'highlight_local' 依賴。它不會安裝 Hermes 內的
+'video_context'、'premiere_cep' package，也不會安裝 FFmpeg、yt-dlp、ASR model
+或 Premiere CEP bridge。
+
+確認 repository 至少包含：
+
+~~~text
+<REPO_ROOT>\package.json
 <REPO_ROOT>\src\index.js
+<REPO_ROOT>\hermes-skills\media\local-livestream-premiere\SKILL.md
+~~~
+
+## 2. 準備本地媒體工具
+
+將相容 executable 放到：
+
+~~~text
 <REPO_ROOT>\tools\bin\ffmpeg.exe
 <REPO_ROOT>\tools\bin\ffprobe.exe
 <REPO_ROOT>\tools\bin\yt-dlp.exe
+~~~
+
+這些檔案被 .gitignore 排除，不會隨 Git clone 一起出現。完成 provisioning 後
+執行：
+
+~~~powershell
+$ToolPaths = @(
+    (Join-Path $RepoRoot 'tools\bin\ffmpeg.exe'),
+    (Join-Path $RepoRoot 'tools\bin\ffprobe.exe'),
+    (Join-Path $RepoRoot 'tools\bin\yt-dlp.exe')
+)
+
+$ToolPaths | ForEach-Object {
+    if (-not (Test-Path -LiteralPath $_ -PathType Leaf)) {
+        throw "Missing local media tool: $_"
+    }
+}
+
+& (Join-Path $RepoRoot 'tools\bin\ffmpeg.exe') -version | Select-Object -First 1
+& (Join-Path $RepoRoot 'tools\bin\ffprobe.exe') -version | Select-Object -First 1
+& (Join-Path $RepoRoot 'tools\bin\yt-dlp.exe') --version
+~~~
+
+若工具不在預設位置，bootstrap 時傳入 '-FfmpegBin' 和 '-FfprobeBin'。目前
+'yt-dlp' 的預設路徑仍是 <REPO_ROOT>\tools\bin\yt-dlp.exe。
+
+## 3. 準備 Hermes Node、MCP entrypoint 和本地 ASR
+
+預設 Hermes layout：
+
+~~~text
 %LOCALAPPDATA%\hermes\node\node.exe
 %LOCALAPPDATA%\hermes\node\node_modules\@smallthinkingmachines\video-context-mcp\dist\index.js
 %LOCALAPPDATA%\hermes\node\node_modules\adobe-premiere-pro-mcp\dist\index.js
 %LOCALAPPDATA%\hermes\node\node_modules\@smallthinkingmachines\video-context-mcp\vendor\transformers.node.min.mjs
-```
+~~~
 
-`<VIDEO_ROOT>` must be an existing absolute folder containing the source videos. It is added to the local highlight server's allowlist; do not use a machine-wide root.
+請使用目前 Hermes distribution 或組織指定的 provisioning/update 流程，將相容
+版本安裝到同一個 Hermes Node 'node_modules' tree。不要只把 package 裝到
+repository 的 'node_modules'，因為 bootstrap 會用 Hermes Node 啟動 entrypoint。
 
-## Bootstrap
+本地 ASR 需要 Transformers runtime 與可用的 model cache。若新機器沒有 cache，
+先在允許下載模型的 provisioning 階段完成模型準備；影片本身仍必須是本地檔案。
+若暫時沒有 ASR runtime，可以使用本地 '.srt' 或 '.vtt' sidecar 作為明確 fallback，
+但結果必須標示不是完整 ASR。
 
-From the repository root, run:
+~~~powershell
+$HermesNodeRoot = Join-Path $HermesRoot 'node'
+$HermesChecks = @(
+    (Join-Path $HermesNodeRoot 'node.exe'),
+    (Join-Path $HermesNodeRoot 'node_modules\@smallthinkingmachines\video-context-mcp\dist\index.js'),
+    (Join-Path $HermesNodeRoot 'node_modules\adobe-premiere-pro-mcp\dist\index.js'),
+    (Join-Path $HermesNodeRoot 'node_modules\@smallthinkingmachines\video-context-mcp\vendor\transformers.node.min.mjs')
+)
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File ".\hermes-skills\media\local-livestream-premiere\scripts\ensure-hermes-config.ps1" -VideoRoot "C:\path\to\videos" -Apply
-```
+$HermesChecks | ForEach-Object {
+    if (-not (Test-Path -LiteralPath $_ -PathType Leaf)) {
+        throw "Missing Hermes runtime or MCP asset: $_"
+    }
+}
+~~~
 
-Use `-RepoRoot`, `-HermesRoot`, `-FfmpegBin`, or `-FfprobeBin` when the default layout differs. Without `-Apply`, the script only validates paths and prints the TOML it would write. With `-Apply`, it preserves unrelated config, replaces only the three managed `mcp_servers` sections, and creates a timestamped `.bak-*` file before writing.
+如果 Hermes 不在 '%LOCALAPPDATA%\hermes'，保留實際安裝位置，稍後以
+'-HermesRoot <實際路徑>' 傳給 bootstrap；不需要複製或改名 runtime。
 
-Use `-Apply` only when environment setup has been requested or explicitly approved. Preview is the correct mode for an analysis-only task.
+## 4. 讓 Hermes 找得到 skill
 
-## Registered servers
+從 repository root 開啟 Hermes，檢查 local skill discovery：
 
-The generated TOML must contain all three entries:
+~~~powershell
+Set-Location -LiteralPath $RepoRoot
+hermes skills list --source all
+~~~
 
-| Server | Command/entrypoint | Required environment |
+輸出應包含本地啟用的 'local-livestream-premiere'。若目前 Hermes build 提供
+skill trust 子命令，而 skill 尚未出現，執行：
+
+~~~powershell
+hermes skills trust $RepoRoot
+hermes skills list --source all
+~~~
+
+若仍找不到，確認沒有在錯誤的資料夾啟動 Hermes，並確認
+'hermes-skills\media\local-livestream-premiere\SKILL.md' 存在。不要自行建立
+另一份同名 skill，避免載入錯誤版本。
+
+## 5. 生成 project-scoped MCP config
+
+本 repository 的唯一 canonical config 是：
+
+~~~text
+<REPO_ROOT>\.codex\config.toml
+~~~
+
+不要使用舊的 YAML config.yaml，也不要把尚未替換的 <REPO_ROOT> 或 <HERMES_ROOT>
+寫進 live config。
+
+先在 preview mode 驗證路徑：
+
+~~~powershell
+Set-Location -LiteralPath $RepoRoot
+$Bootstrap = Join-Path $RepoRoot 'hermes-skills\media\local-livestream-premiere\scripts\ensure-hermes-config.ps1'
+powershell -NoProfile -ExecutionPolicy Bypass -File $Bootstrap -RepoRoot $RepoRoot -HermesRoot $HermesRoot -VideoRoot $VideoRoot
+~~~
+
+確認 preview 沒有 missing path 後，才套用設定：
+
+~~~powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File $Bootstrap -RepoRoot $RepoRoot -HermesRoot $HermesRoot -VideoRoot $VideoRoot -Apply
+~~~
+
+工具不在預設位置時：
+
+~~~powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File $Bootstrap -RepoRoot $RepoRoot -HermesRoot $HermesRoot -VideoRoot $VideoRoot -FfmpegBin 'D:\Tools\ffmpeg.exe' -FfprobeBin 'D:\Tools\ffprobe.exe' -Apply
+~~~
+
+bootstrap 會：
+
+- 驗證 Hermes Node、三個 entrypoint、FFmpeg/FFprobe/yt-dlp 和 VideoRoot。
+- 產生或合併 <REPO_ROOT>\.codex\config.toml。
+- 只管理 'video_context'、'highlight_local'、'premiere_cep' 三個 server block，保留其他設定。
+- 若 config 已存在，先建立 timestamped .bak-* backup。
+- 將 <VIDEO_ROOT> 放入 'HIGHLIGHT_ALLOWED_ROOTS'，不放寬到整台機器。
+- 指向本地 cache、Transformers runtime 和 system FFmpeg toolchain。
+
+生成的 server map 應符合：
+
+| Server | 啟動方式 | 重要環境 |
 |---|---|---|
-| `video_context` | Hermes Node → `@smallthinkingmachines\video-context-mcp\dist\index.js` | system toolchain, local FFmpeg/FFprobe/yt-dlp, local cache, Transformers ASR/OCR |
-| `highlight_local` | Hermes Node → `<REPO_ROOT>\src\index.js` | project root, semicolon-separated allowlist, local FFmpeg/FFprobe, ASR runtime/cache, motion enabled |
-| `premiere_cep` | Hermes Node → `adobe-premiere-pro-mcp\dist\index.js` | local `PREMIERE_TEMP_DIR` for the CEP bridge |
+| 'video_context' | Hermes Node → video-context-mcp entrypoint | system FFmpeg/FFprobe/yt-dlp、local cache、Transformers ASR/OCR |
+| 'highlight_local' | Hermes Node → <REPO_ROOT>\src\index.js | project root、VideoRoot allowlist、local FFmpeg/FFprobe、ASR runtime/cache、motion enabled |
+| 'premiere_cep' | Hermes Node → adobe-premiere-pro-mcp entrypoint | local PREMIERE_TEMP_DIR、CEP bridge |
 
-Each server needs its `cwd`, `startup_timeout_sec`, `tool_timeout_sec`, and `default_tools_approval_mode = 'writes'`. The analysis entrypoint is `src\index.js`; do not point `highlight_local` at the skill directory.
+'.codex'、'.cache'、'node_modules'、'tools\bin' 和使用者路徑都是本機生成或安裝
+內容，不應 commit 到 repository。
 
-## Verification
+## 6. 重新啟動 Hermes 並驗證三個 MCP
 
-Start a fresh Hermes session after applying the config:
+套用 config 後，關閉舊 session，從 repository root 開啟新的 Hermes session：
 
-```powershell
+~~~powershell
+Set-Location -LiteralPath $RepoRoot
 hermes mcp list
 hermes mcp test video_context
 hermes mcp test highlight_local
 hermes mcp test premiere_cep
-```
+~~~
 
-Expected `highlight_local` `server_info` values include `localOnly: true`, `uxp: false`, and `networkListener: false`. The Premiere test needs the CEP bridge panel open; a closed panel is an operational dependency, not a reason to switch to UXP.
+預期 server 至少提供：
 
-## Troubleshooting
+- 'video_context'：list_videos、ingest_video、get_ingest_status、get_video_timeline、search_videos、get_transcript，以及可用時的 peek_frame。
+- 'highlight_local'：server_info、analyze_video、get_analysis_status、get_frame，以及可用時的 export_premiere_plan。
+- 'premiere_cep'：verify_premiere_connection、import_media、duplicate_sequence、add_to_timeline_batch、add_marker、set_active_sequence、list_sequence_tracks、validate_project_for_export。
 
-- `server not found` or no tools: restart Hermes and confirm the process was started from the repository/project context that loads `.codex\config.toml`.
-- `Cannot find module`: verify the Hermes Node path and the package entrypoint under the same `node_modules` tree; do not use a different global Node installation unless its dependencies are installed there.
-- FFmpeg/FFprobe errors: provide absolute `-FfmpegBin`/`-FfprobeBin` paths and confirm both files exist.
-- ASR unavailable: provide a local `.srt`/`.vtt` sidecar or verify the bundled Transformers runtime and cache paths.
-- Allowlist denied: pass the parent directory of the video as `-VideoRoot`; keep the path absolute and local.
-- CEP unavailable: open Premiere Pro and the CEP bridge panel, then rerun only `hermes mcp test premiere_cep`.
+'hermes mcp test premiere_cep' 能連到 MCP process，不代表 Premiere 已準備好。
+實際剪輯前仍要啟動 Premiere、載入 project、開啟 CEP bridge panel，再以
+'verify_premiere_connection' 確認應用程式連線。
 
-Never solve a setup failure with cloud video processing, UXP, raw ExtendScript, a network listener, or by widening the allowlist to the whole machine.
+如果 'highlight_local' 的 'server_info' 可用，應確認 local-only、'uxp: false'
+和 'networkListener: false'。連線失敗時修正安裝或 CEP panel，不要切換協定。
+
+## 7. 第一次實際剪輯的安全流程
+
+### 7.1 分析階段：不修改 Premiere
+
+向 Hermes 提供影片絕對本地路徑、目標風格和期望片段長度：
+
+~~~text
+使用 local-livestream-premiere 分析 C:\Videos\stream.mp4，找出 15–60 秒的 viral moments。
+先只回傳候選清單，不要修改 Premiere。
+~~~
+
+正常順序：
+
+1. 'video_context' ingest 影片，或重用相同本地影片的 video_id。
+2. 長影片優先採 ASR-first：visual=false、embed=false、whisper_fallback=true。
+3. 用 transcript、timeline 和短搜尋找候選。
+4. 'highlight_local' 必要時補 scene boundary、低權重 motion、相對 audio burst、transcript score，或輸出 JSON/FCP7 handoff。
+5. 只對 shortlist 取 frame/OCR。
+6. 回傳 candidate ID、起訖時間、duration、score、理由、短 quote/visual cue 和證據限制。
+
+### 7.2 核准閘門
+
+分析結果出來後必須停止，等待使用者明確核准 candidate ID 或時間範圍：
+
+~~~text
+使用 candidate highlight-001 和 highlight-004，建立一個新的 vertical highlights sequence。
+~~~
+
+單純說「分析影片」不包含修改 Premiere 的授權。
+
+### 7.3 剪輯階段：使用 CEP、保留原始 sequence
+
+核准後才執行：
+
+1. 'premiere_cep.verify_premiere_connection'。
+2. 'duplicate_sequence' 或建立新 sequence；不要清空、刪除或覆寫原始 sequence。
+3. 'import_media'（若素材尚未在 project）。
+4. 用 'add_to_timeline_batch' 加入核准的 in/out，保留需要的 linked audio。
+5. 用 'add_marker' 標記來源時間或 candidate ID，並 'set_active_sequence'。
+6. 用 'list_sequence_tracks'、'validate_project_for_export' 做 read-only verification。
+7. 只有使用者另外要求時，才 'save_project'、Save As 或 export。
+
+完成回報列出 sequence、clip 數、audio linkage、gap/offline media、duration，以及
+目前仍未儲存或未輸出的項目。
+
+## 8. 常見問題與回復
+
+| 現象 | 處理 |
+|---|---|
+| Skill 不存在 | 確認 Hermes 從 repository root 啟動、skill discovery/trust 已完成，且 SKILL.md 路徑正確；然後重啟。 |
+| server not found / 沒有 tools | 確認 '<REPO_ROOT>\.codex\config.toml' 已生成，從 repository root 開新 session，再跑 'hermes mcp list'。 |
+| Cannot find module | Hermes Node 與 entrypoint 不在同一個 node_modules tree，或 MCP package 未安裝；重新檢查第 3 節。 |
+| FFmpeg/FFprobe/yt-dlp missing | 檢查 tools\bin，或用 '-FfmpegBin'、'-FfprobeBin' 傳入絕對路徑；VideoRoot 也必須存在。 |
+| ASR 不可用 | 確認 Transformers runtime/model cache；或提供本地 .srt/.vtt sidecar，並在結果中標示 fallback。 |
+| highlight_local 拒絕影片路徑 | 用影片所在的本地父資料夾作為 '-VideoRoot'，不要用整台磁碟或根目錄放寬 allowlist。 |
+| premiere_cep process 已連線但 Premiere verify 失敗 | 啟動 Premiere、載入 project、開啟 CEP bridge panel，再重跑 connection verify。 |
+| 分析超時 | 重用 indexed video_id，以 ASR-first、短搜尋和 shortlist frame inspection 降低成本。 |
+
+遇到 bootstrap 失敗時，保留它回報的第一個 missing path，先補齊該依賴再重跑
+preview。不要用替代協定繞過安全邊界。
+
+## 9. 更新與最終檢查
+
+repository 更新後：
+
+~~~powershell
+Set-Location -LiteralPath $RepoRoot
+git pull
+npm ci
+npm test
+~~~
+
+若 MCP 路徑或 Hermes 位置改變，重新執行 preview，再以 '-Apply' 更新
+'.codex\config.toml'。不要 commit 以下本機內容：
+
+- '.codex\config.toml' 及 '.codex\config.toml.bak-*'
+- '.cache\'、'.analysis\'、ASR/model cache
+- 'tools\bin\' 下的 executable
+- 'node_modules\'
+- 影片、'.prproj'、export 和包含使用者路徑的分析 artifact
+
+最終 checklist：
+
+- [ ] Hermes 可執行，且從 <REPO_ROOT> 啟動。
+- [ ] npm ci 與 npm test 通過。
+- [ ] FFmpeg、FFprobe、yt-dlp 位於預期位置或已傳入 override。
+- [ ] Hermes Node、三個 entrypoint 和 Transformers runtime 存在。
+- [ ] local-livestream-premiere 已被 Hermes discovery 啟用。
+- [ ] bootstrap preview 通過，-Apply 已生成 project-scoped TOML。
+- [ ] 三個 hermes mcp test 都通過。
+- [ ] Premiere Pro 與 CEP bridge panel 已準備好。
+- [ ] 分析先於剪輯，且取得 candidate approval。
+- [ ] 原始 sequence 保留，新 sequence 完成 read-only verification。
+- [ ] 儲存或 export 只在使用者明確要求後執行。

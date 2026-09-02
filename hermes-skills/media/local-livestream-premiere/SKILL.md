@@ -23,6 +23,8 @@ Use this skill when the user wants a local livestream searched for product infor
 
 ## Environment bootstrap (read this section before using the workflow)
 
+For a brand-new Windows machine, read [references/mcp-setup-windows.md](references/mcp-setup-windows.md) first. It covers one-time host provisioning, skill discovery, MCP config generation, verification, and the boundary between setup and the daily editing workflow.
+
 This skill is intended to be sufficient to configure the local environment. The canonical Hermes configuration for this repository is the project-scoped `<REPO_ROOT>\.codex\config.toml` in TOML format. Do not create a YAML `config.yaml` for this project and do not assume that merely listing the three server names registers them.
 
 When any server is missing or the project has not been set up, resolve:
@@ -38,7 +40,7 @@ Run the repository bootstrap script with the user's actual video folder:
 powershell -NoProfile -ExecutionPolicy Bypass -File "<REPO_ROOT>\hermes-skills\media\local-livestream-premiere\scripts\ensure-hermes-config.ps1" -VideoRoot "<VIDEO_ROOT>" -Apply
 ```
 
-The script validates the Hermes Node runtime, the three local entrypoints, and the bundled FFmpeg/FFprobe/yt-dlp tools; writes/merges `<REPO_ROOT>\.codex\config.toml`, preserves unrelated settings, and backs up an existing project config before applying the managed server block. It registers exactly:
+The script validates the Hermes Node runtime, the three local entrypoints, and the bundled FFmpeg/FFprobe/yt-dlp tools; writes/merges `<REPO_ROOT>\.codex\config.toml`, preserves unrelated settings, and backs up an existing project config before applying the managed server block. It registers:
 
 Only use `-Apply` when the user has requested environment setup or explicitly approved writing the project config. For an analysis-only request, run the script in preview mode or report the missing setup instead.
 
@@ -85,7 +87,7 @@ All three server registrations are required for the complete workflow. If a tool
 
 1. Confirm the absolute local video path and the requested cut style/length. If either materially changes the result and cannot be inferred, ask before analysis.
 2. Follow [references/operational-playbook.md](references/operational-playbook.md) for the low-token ASR search, candidate scoring, review gate, and Premiere assembly.
-3. If any MCP server is not already available, run the Environment bootstrap above. Read [references/mcp-setup-windows.md](references/mcp-setup-windows.md) only for troubleshooting or non-default Hermes locations; it must agree with the generated TOML config.
+3. If any MCP server is not already available, read [references/mcp-setup-windows.md](references/mcp-setup-windows.md) and complete the bootstrap/verification there. For non-default Hermes locations, pass the documented path overrides; the reference must agree with the generated TOML config.
 4. Return an analysis table containing ID, source start/end, duration, score, reason, short quote or visual cue, and evidence limitations. Include transcript, audio burst, scene boundary, and motion evidence when available.
 5. Stop after the candidate table until the user approves. “Analyze” alone is not permission to mutate Premiere; “use candidates V-02, V-05” or an equivalent explicit instruction is.
 6. After approval, verify CEP, assemble the approved ranges in a new/duplicated sequence, add navigation markers, set the new sequence active, and verify tracks, gaps, offline media, and duration.
